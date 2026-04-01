@@ -6,5 +6,6 @@
 """Storage for the learning algorithms."""
 
 from .rollout_storage import RolloutStorage
+from .replay_buffer import TensorDictReplayBuffer
 
-__all__ = ["RolloutStorage"]
+__all__ = ["RolloutStorage", "TensorDictReplayBuffer"]
