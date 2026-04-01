@@ -64,7 +64,7 @@ When touching REPPO code, check at least:
 ### Validation
 - [x] Add a replay-buffer unit test.
 - [x] Add a single-step FastTD3 smoke test.
-- [ ] Run the `mjlab2` suite against the local `rsl_rl` checkout after the first end-to-end slice.
+- [x] Run the `mjlab2` suite against the local `rsl_rl` checkout after the first end-to-end slice.
 
 ## Progress Log
 
@@ -77,3 +77,5 @@ When touching REPPO code, check at least:
 - 2026-04-01: FastTD3 updated to use distributional critics, reference-style exploration noise, and clipped-double-Q actor updates.
 - 2026-04-01: Parity pass aligned the FastTD3 actor/critic defaults with the reference architecture and added optional reward normalization support.
 - 2026-04-01: FastTD3 now supports n-step replay sampling and cosine LR schedules, and REPPO defaults were aligned with the reference TorchRL config.
+- 2026-04-01: Replay sampling was tightened to an env-aware trajectory path, matching the reference minibatch geometry more closely.
+- 2026-04-01: FastTD3 now waits on env-step history for learning and uses a per-env minibatch sample contract like the reference implementation.

@@ -25,9 +25,10 @@ class _BatchedReplayBufferState:
 
 
 class TensorDictReplayBuffer:
-    """Ring buffer for batched TensorDict transitions.
+    """Ring buffer for TensorDict transitions.
 
-    The buffer stores individual transitions, but accepts a leading batch dimension when adding data.
+    When ``num_envs`` is provided, the buffer keeps per-environment trajectories separate and samples
+    batches in an env-aware way. Otherwise it falls back to a flat ring buffer for legacy tests.
     """
 
     def __init__(
@@ -46,7 +47,7 @@ class TensorDictReplayBuffer:
         self.num_envs = int(num_envs) if num_envs is not None else None
         self.n_steps = max(1, int(n_steps))
         self.gamma = float(gamma)
-        self._batched = self.num_envs is not None and self.n_steps > 1
+        self._batched = self.num_envs is not None
         if self._batched:
             self._storage: list[list[TensorDict | None]] = [
                 [None] * self.capacity for _ in range(self.num_envs or 0)
@@ -111,13 +112,14 @@ class TensorDictReplayBuffer:
             raise RuntimeError("Cannot sample from an empty replay buffer.")
         if batch_size <= 0:
             raise ValueError(f"Batch size must be positive, got {batch_size}.")
+
+        if self._batched:
+            return self._sample_env_aware(batch_size, device=device, generator=generator)
+
         if batch_size > self._size:
             raise ValueError(
                 f"Cannot sample batch_size={batch_size} from replay buffer with size {self._size}."
             )
-
-        if self._batched:
-            return self._sample_batched(batch_size, device=device, generator=generator)
 
         indices = torch.randint(self._size, (batch_size,), generator=generator)
         ordered = self._ordered_storage()
@@ -202,7 +204,7 @@ class TensorDictReplayBuffer:
             ordered.append(entry)
         return ordered
 
-    def _sample_batched(
+    def _sample_env_aware(
         self,
         batch_size: int,
         device: torch.device | str | None = None,
@@ -210,26 +212,29 @@ class TensorDictReplayBuffer:
     ) -> TensorDict:
         if self.num_envs is None:
             raise RuntimeError("Batched replay buffer is missing num_envs.")
+        if self._size == 0:
+            raise RuntimeError("Cannot sample from an empty replay buffer.")
         if self.n_steps <= 1:
-            return self._sample_batched_single_step(batch_size, device=device, generator=generator)
+            return self._sample_env_aware_single_step(batch_size, device=device, generator=generator)
         if self._size < self.n_steps:
             raise RuntimeError(
                 f"Cannot sample n-step batch with size {self._size} and n_steps={self.n_steps}."
             )
 
         valid_starts = self._size - self.n_steps + 1
-        env_indices = torch.randint(self.num_envs, (batch_size,), generator=generator)
-        start_indices = torch.randint(valid_starts, (batch_size,), generator=generator)
-        samples = [
-            self._sample_sequence(int(env_idx), int(start_idx))
-            for env_idx, start_idx in zip(env_indices.tolist(), start_indices.tolist(), strict=False)
-        ]
+        samples = []
+        for env_idx in range(self.num_envs):
+            start_indices = torch.randint(valid_starts, (batch_size,), generator=generator)
+            samples.extend(
+                self._sample_sequence(env_idx, int(start_idx))
+                for start_idx in start_indices.tolist()
+            )
         batch = TensorDict.stack(samples, dim=0)
         if device is not None:
             batch = batch.to(device)
         return batch
 
-    def _sample_batched_single_step(
+    def _sample_env_aware_single_step(
         self,
         batch_size: int,
         device: torch.device | str | None = None,
@@ -237,12 +242,11 @@ class TensorDictReplayBuffer:
     ) -> TensorDict:
         if self.num_envs is None:
             raise RuntimeError("Batched replay buffer is missing num_envs.")
-        env_indices = torch.randint(self.num_envs, (batch_size,), generator=generator)
-        start_indices = torch.randint(self._size, (batch_size,), generator=generator)
-        samples = [
-            self._ordered_storage_for_env(int(env_idx))[int(start_idx)]
-            for env_idx, start_idx in zip(env_indices.tolist(), start_indices.tolist(), strict=False)
-        ]
+        samples = []
+        for env_idx in range(self.num_envs):
+            start_indices = torch.randint(self._size, (batch_size,), generator=generator)
+            env_storage = self._ordered_storage_for_env(env_idx)
+            samples.extend(env_storage[int(start_idx)].clone() for start_idx in start_indices.tolist())
         batch = TensorDict.stack(samples, dim=0)
         if device is not None:
             batch = batch.to(device)

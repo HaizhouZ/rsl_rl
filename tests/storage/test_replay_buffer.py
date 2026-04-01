@@ -146,3 +146,37 @@ def test_replay_buffer_n_step_sampling() -> None:
     assert torch.allclose(sample["next"]["rewards"], torch.tensor([[2.8]]))
     assert torch.equal(sample["next"]["observations"], torch.tensor([[7.0, 8.0]]))
     assert torch.equal(sample["next"]["effective_n_steps"], torch.tensor([[2.0]]))
+
+
+def test_replay_buffer_env_aware_sampling_keeps_envs_separate() -> None:
+    buffer = TensorDictReplayBuffer(capacity=4, num_envs=2, n_steps=1, gamma=0.9)
+
+    for step in range(2):
+        buffer.add(
+            TensorDict(
+                {
+                    "observations": torch.tensor(
+                        [[float(step), float(step + 1)], [100.0 + step, 101.0 + step]]
+                    ),
+                    "actions": torch.tensor([[0.1 + step], [0.2 + step]]),
+                    "next": TensorDict(
+                        {
+                            "observations": torch.tensor(
+                                [[float(step + 2), float(step + 3)], [102.0 + step, 103.0 + step]]
+                            ),
+                            "rewards": torch.tensor([[1.0 + step], [2.0 + step]]),
+                            "dones": torch.zeros(2, 1),
+                            "truncations": torch.zeros(2, 1),
+                        },
+                        batch_size=(2,),
+                    ),
+                },
+                batch_size=(2,),
+            )
+        )
+
+    sample = buffer.sample(1, generator=torch.Generator().manual_seed(0))
+    assert sample.batch_size == torch.Size([2])
+    assert sample["observations"].shape == (2, 2)
+    assert sample["observations"][0, 0] < 10.0
+    assert sample["observations"][1, 0] >= 100.0

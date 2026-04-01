@@ -199,12 +199,13 @@ class FastTD3:
         """FastTD3 is off-policy and does not use return bootstrapping here."""
 
     def update(self) -> dict[str, float]:
-        if len(self.replay_buffer) < max(self.learning_starts, self.batch_size):
+        per_env_batch = max(1, self.batch_size // self.actor.n_envs)
+        if len(self.replay_buffer) < max(self.learning_starts, per_env_batch):
             return {}
 
         logs: dict[str, list[float]] = defaultdict(list)
         for _ in range(self.num_updates):
-            batch = self.replay_buffer.sample(self.batch_size, device=self.device)
+            batch = self.replay_buffer.sample(per_env_batch, device=self.device)
             actor_obs = batch["observations"]
             next_obs = batch["next"]["observations"]
             actions = batch["actions"]
