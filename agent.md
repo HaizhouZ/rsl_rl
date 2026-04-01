@@ -1,115 +1,102 @@
 # agent.md
 
-## Purpose
-This repository (`rsl_rl`, package name `rsl-rl-lib`) is a lightweight, GPU-first reinforcement learning library focused on robot learning workflows. It provides:
-- On-policy RL training (PPO).
-- Student-teacher behavior distillation.
-- Optional extensions (RND intrinsic reward and symmetry augmentation/loss).
-- Modular policy/model blocks (MLP/CNN/RNN + configurable action distributions).
+## Goal
+Port the Torch `reppo` implementation into `rsl_rl` so `mjlab2` can use it through the existing `rsl_rl`-style training interfaces.
 
-## Repository Map
-- `rsl_rl/algorithms/`: training algorithms (`PPO`, `Distillation`).
-- `rsl_rl/runners/`: orchestration loops (`OnPolicyRunner`, `DistillationRunner`).
-- `rsl_rl/models/`: high-level policy/value model wrappers (`MLPModel`, `CNNModel`, `RNNModel`).
-- `rsl_rl/modules/`: neural network primitives and distributions (`MLP`, `CNN`, `RNN`, `GaussianDistribution`, normalization modules).
-- `rsl_rl/storage/`: rollout buffer and batch generators (`RolloutStorage`).
-- `rsl_rl/env/`: vectorized environment interface (`VecEnv`) expected by runners/algorithms.
-- `rsl_rl/extensions/`: optional training extensions (RND and symmetry config resolution).
-- `rsl_rl/utils/`: utility resolvers and helpers (`resolve_callable`, `resolve_obs_groups`, etc.).
-- `tests/`: unit/integration tests.
+The target is not a literal copy of the reference repository. The target is a clean `rsl_rl` implementation that:
+- fits the `VecEnv` contract used by `mjlab2`,
+- preserves the current runner lifecycle where possible,
+- keeps the `mjlab2` changes small,
+- and avoids pulling the reference repo into `mjlab2` as a dependency.
 
-## Core Runtime Interfaces
+## Port Strategy
 
-### 1) Environment contract: `VecEnv`
-Any environment must implement:
-- `get_observations() -> TensorDict`
-- `step(actions: Tensor) -> (obs: TensorDict, rewards: Tensor, dones: Tensor, extras: dict)`
+### 1) Keep `mjlab2` on the existing runner boundary
+`mjlab2` already wraps its environments with `RslRlVecEnvWrapper` and launches training through task-registered runner classes.
+The migration should therefore prefer:
+- a new `rsl_rl` algorithm implementation,
+- reusable `rsl_rl` policy/value modules,
+- and the existing `OnPolicyRunner` flow if the new algorithm can satisfy that contract.
 
-Required attributes include:
-- `num_envs`, `num_actions`
-- `max_episode_length`, `episode_length_buf`
-- `device`, `cfg`
+This avoids rewriting the `mjlab2` training script.
 
-Important `extras` keys consumed by training code:
-- `"time_outs"`: used for timeout bootstrapping in PPO.
-- `"log"`: additional scalar/tensor logging payloads.
-
-### 2) Runner contract
-`OnPolicyRunner` handles:
-- Multi-GPU bootstrap from `WORLD_SIZE/LOCAL_RANK/RANK`.
-- Algorithm construction from config via `resolve_callable`.
-- Rollout collection + update loop.
-- Logging, checkpoint save/load, and export to JIT/ONNX.
-
-`DistillationRunner` extends `OnPolicyRunner` and enforces that teacher weights are loaded before learning.
-
-### 3) Algorithm contract
-Both algorithm classes expose a similar lifecycle used by runners:
-- `act(obs)`
-- `process_env_step(obs, rewards, dones, extras)`
-- `compute_returns(obs)`
-- `update() -> dict[str, float]`
-- `train_mode()`, `eval_mode()`
-- `save()`, `load(...)`
+### 2) Implement `Reppo` as a first-class `rsl_rl` algorithm
+The `Reppo` algorithm should expose the same surface that `OnPolicyRunner` expects:
+- `construct_algorithm(...)`
+- `act(...)`
+- `process_env_step(...)`
+- `compute_returns(...)`
+- `update()`
+- `train_mode()` / `eval_mode()`
+- `save()` / `load(...)`
 - `get_policy()`
 
-`PPO` specifics:
-- Uses actor/critic models + rollout storage.
-- Supports adaptive KL learning-rate schedule.
-- Supports optional RND and symmetry logic.
+The internal logic can differ from PPO, but the outer contract should remain compatible.
 
-`Distillation` specifics:
-- Uses student (trainable) and teacher (target) policies.
-- Optimizes behavior loss (`mse` or `huber`).
-- Does not use return computation.
+### 3) Add dedicated model code rather than overloading PPO models
+`reppo` needs:
+- a squashed Gaussian actor,
+- a distributional critic,
+- empirical normalization,
+- and export-friendly policy access for `mjlab2` task-specific ONNX exporters.
 
-### 4) Storage contract: `RolloutStorage`
-`RolloutStorage` is shared by both RL and distillation:
-- `Transition`: per-step record container.
-- `Batch`: yielded training mini-batch view.
-- `add_transition(...)`, `clear()`
-- Distillation iterator: `generator()`
-- PPO iterators:
-  - `mini_batch_generator(...)` for feedforward models
-  - `recurrent_mini_batch_generator(...)` for recurrent models
+These should live in `rsl_rl` as reusable modules instead of being embedded inside `mjlab2`.
 
-## Model and Module Layering
-- `models/*_model.py` are policy/value wrappers that:
-  - select configured observation groups,
-  - optionally normalize observations,
-  - route features through backbone module,
-  - optionally attach stochastic distributions.
-- `modules/*` provide reusable blocks:
-  - feature extractors (`MLP`, `CNN`, `RNN`),
-  - stochastic output distributions,
-  - normalization primitives.
+### 4) Keep `mjlab2` changes minimal
+The expected `mjlab2` changes should be limited to:
+- selecting the new `Reppo` algorithm in task config,
+- adding any required `reppo`-specific runner config fields,
+- and only touching custom runner wrappers if they need to recognize the new policy object.
 
-## Configuration & Resolution Patterns
-The codebase heavily uses string-to-callable resolution and observation mapping:
-- `resolve_callable(...)`: accepts direct callable or import path string.
-- `resolve_obs_groups(...)`: validates/fills observation set mappings (e.g., actor/critic/student/teacher).
-- `resolve_optimizer(...)`, `resolve_nn_activation(...)`: map string names to torch components.
+The goal is to avoid changing the main training script unless a hard compatibility gap appears.
 
-This allows external projects to inject custom classes/functions through config without modifying rsl_rl internals.
+## Implementation Order
 
-## Typical Training Flow (On-policy PPO)
-1. Create a `VecEnv` implementation.
-2. Build runner with `train_cfg`.
-3. Runner resolves and constructs algorithm/models/storage.
-4. Iterative loop:
-   - `act` -> `env.step` -> `process_env_step` (for `num_steps_per_env`)
-   - `compute_returns`
-   - `update`
-5. Log metrics and periodically checkpoint.
-6. Optionally export policy to TorchScript or ONNX.
+### Phase 1: Model and utility layer
+1. Add a squashed-Gaussian policy implementation in `rsl_rl`.
+2. Add a distributional critic implementation in `rsl_rl`.
+3. Reuse `rsl_rl.modules.EmpiricalNormalization` where possible.
+4. Add any helper math needed for the relative-entropy target / value binning.
 
-## Development Notes
-- Python requirement: `>=3.9`.
-- Key dependencies: PyTorch, TensorDict, NumPy, ONNX stack.
-- Style/contrib expectations: PEP 8, Google-style docstrings, run `pre-commit run --all-files`.
+### Phase 2: Algorithm layer
+1. Add `rsl_rl.algorithms.reppo.Reppo`.
+2. Make the algorithm build and own the actor, critic, optimizers, and normalizers.
+3. Mirror the data flow from the reference implementation:
+   - rollout collection,
+   - bootstrapped target computation,
+   - critic update,
+   - actor update,
+   - checkpoint save/load.
 
-## Fast Start Commands
-```bash
-pip install -e .
-pre-commit run --all-files
-```
+### Phase 3: Runner compatibility
+1. Verify `OnPolicyRunner` can drive `Reppo` without changes.
+2. Only add a new runner if the algorithm cannot fully satisfy the existing runner contract.
+3. Preserve checkpointing and logging behavior.
+
+### Phase 4: `mjlab2` integration
+1. Point selected `mjlab2` tasks at the `Reppo` algorithm.
+2. Keep the task registry and wrapper flow intact.
+3. Update only the task configs that need new hyperparameters or model class names.
+
+### Phase 5: Validation
+1. Add a focused unit test for the new policy/model primitives.
+2. Add a short runner smoke test for `Reppo`.
+3. Verify `mjlab2` can still construct its existing PPO tasks unchanged.
+4. Verify at least one task can train with the new `Reppo` path.
+
+## Non-Goals
+- Do not vendor the reference `reppo` repository into `mjlab2`.
+- Do not introduce a parallel training entrypoint in `mjlab2` unless the existing runner contract cannot support the new algorithm.
+- Do not refactor unrelated PPO or distillation code while porting `Reppo`.
+
+## Risk Areas
+- The squashed action distribution must preserve correct log-probabilities and deterministic export behavior.
+- The distributional critic must stay numerically stable under the value target transform.
+- Custom `mjlab2` ONNX exporters may need a thin compatibility shim if they assume PPO-specific actor internals.
+- Multi-GPU behavior should remain rank-safe for checkpointing and logging.
+
+## Definition of Done
+- `rsl_rl` exposes a `Reppo` implementation that can be resolved through the same `class_name` mechanism as existing algorithms.
+- `mjlab2` can opt into `Reppo` with minimal config changes.
+- Existing PPO and distillation behavior in `rsl_rl` is unchanged.
+- The new code has at least one smoke test covering construction and a short training step.
