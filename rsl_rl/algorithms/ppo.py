@@ -111,6 +111,7 @@ class PPO:
         # PPO components
         self.actor = actor.to(self.device)
         self.critic = critic.to(self.device)
+        self.policy = self.actor
 
         # Create the optimizer
         self.optimizer = resolve_optimizer(optimizer)(
@@ -455,9 +456,11 @@ class PPO:
 
         # Load the specified models
         if load_cfg.get("actor"):
-            self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
+            actor_state = loaded_dict.get("actor_state_dict", loaded_dict.get("model_state_dict"))
+            self.actor.load_state_dict(actor_state, strict=strict)
         if load_cfg.get("critic"):
-            self.critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
+            critic_state = loaded_dict.get("critic_state_dict", loaded_dict.get("model_state_dict"))
+            self.critic.load_state_dict(critic_state, strict=strict)
         if load_cfg.get("optimizer"):
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
         if load_cfg.get("rnd") and self.rnd:
@@ -474,8 +477,11 @@ class PPO:
         """Construct the PPO algorithm."""
         # Resolve class callables
         alg_class: type[PPO] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
-        actor_class: type[MLPModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
-        critic_class: type[MLPModel] = resolve_callable(cfg["critic"].pop("class_name"))  # type: ignore
+        policy_cfg = dict(cfg.get("policy") or {})
+        actor_cfg = dict(cfg.get("actor") or policy_cfg)
+        critic_cfg = dict(cfg.get("critic") or policy_cfg)
+        actor_class: type[MLPModel] = resolve_callable(actor_cfg.pop("class_name"))  # type: ignore
+        critic_class: type[MLPModel] = resolve_callable(critic_cfg.pop("class_name"))  # type: ignore
 
         # Resolve observation groups
         default_sets = ["actor", "critic"]
@@ -490,11 +496,11 @@ class PPO:
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
 
         # Initialize the policy
-        actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
+        actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **actor_cfg).to(device)
         print(f"Actor Model: {actor}")
         if cfg["algorithm"].pop("share_cnn_encoders", None):  # Share CNN encoders between actor and critic
-            cfg["critic"]["cnns"] = actor.cnns  # type: ignore
-        critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
+            critic_cfg["cnns"] = actor.cnns  # type: ignore
+        critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **critic_cfg).to(device)
         print(f"Critic Model: {critic}")
 
         # Initialize the storage

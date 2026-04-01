@@ -265,12 +265,12 @@ class Logger:
 
     def save_model(self, path: str, it: int) -> None:
         """Save the model to external logging services if specified."""
-        if self.writer is not None and self.logger_type in ["neptune", "wandb"]:
+        if hasattr(self, "writer") and self.writer is not None and self.logger_type in ["neptune", "wandb"]:
             self.writer.save_model(path, it)  # type: ignore
 
     def stop_logging_writer(self) -> None:
         """Stop the logging writer."""
-        if self.writer is not None and self.logger_type in ["neptune", "wandb"]:
+        if hasattr(self, "writer") and self.writer is not None and self.logger_type in ["neptune", "wandb"]:
             self.writer.stop()  # type: ignore
 
     def _store_code_state(self) -> list[str]:
