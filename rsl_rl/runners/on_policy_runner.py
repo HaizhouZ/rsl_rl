@@ -154,18 +154,6 @@ class OnPolicyRunner:
             strict (bool): Whether state_dict loading should be strict.
             map_location (str | None): Device mapping for loading the model.
         """
-        if isinstance(load_cfg, bool):
-            load_optimizer = load_cfg
-            if map_location is None and isinstance(strict, str):
-                map_location = strict
-                strict = True
-            load_cfg = {
-                "actor": True,
-                "critic": True,
-                "optimizer": load_optimizer,
-                "iteration": True,
-                "rnd": True,
-            }
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
         if load_iteration:
