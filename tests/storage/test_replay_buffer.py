@@ -100,3 +100,49 @@ def test_replay_buffer_overwrites_old_items() -> None:
     assert len(state["storage"]) == 2
     assert torch.equal(state["storage"][0]["obs"], torch.tensor([1.0, 2.0]))
     assert torch.equal(state["storage"][1]["obs"], torch.tensor([2.0, 3.0]))
+
+
+def test_replay_buffer_n_step_sampling() -> None:
+    buffer = TensorDictReplayBuffer(capacity=4, num_envs=1, n_steps=2, gamma=0.9)
+
+    first = TensorDict(
+        {
+            "observations": torch.tensor([[1.0, 2.0]]),
+            "actions": torch.tensor([[0.1]]),
+            "next": TensorDict(
+                {
+                    "observations": torch.tensor([[3.0, 4.0]]),
+                    "rewards": torch.tensor([[1.0]]),
+                    "dones": torch.tensor([[0.0]]),
+                    "truncations": torch.tensor([[0.0]]),
+                },
+                batch_size=(1,),
+            ),
+        },
+        batch_size=(1,),
+    )
+    second = TensorDict(
+        {
+            "observations": torch.tensor([[5.0, 6.0]]),
+            "actions": torch.tensor([[0.2]]),
+            "next": TensorDict(
+                {
+                    "observations": torch.tensor([[7.0, 8.0]]),
+                    "rewards": torch.tensor([[2.0]]),
+                    "dones": torch.tensor([[0.0]]),
+                    "truncations": torch.tensor([[0.0]]),
+                },
+                batch_size=(1,),
+            ),
+        },
+        batch_size=(1,),
+    )
+
+    buffer.add(first)
+    buffer.add(second)
+
+    sample = buffer.sample(1, generator=torch.Generator().manual_seed(0))
+    assert sample["next"]["rewards"].shape == (1, 1)
+    assert torch.allclose(sample["next"]["rewards"], torch.tensor([[2.8]]))
+    assert torch.equal(sample["next"]["observations"], torch.tensor([[7.0, 8.0]]))
+    assert torch.equal(sample["next"]["effective_n_steps"], torch.tensor([[2.0]]))

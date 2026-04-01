@@ -55,6 +55,7 @@ class OffPolicyRunner:
             )
 
         obs = self.env.get_observations().to(self.device)
+        dones = torch.zeros(self.env.num_envs, device=self.device)
         self.alg.train_mode()
         if self.is_distributed:
             self.alg.broadcast_parameters()
@@ -66,7 +67,7 @@ class OffPolicyRunner:
             start = time.time()
             with torch.inference_mode():
                 for _ in range(self.cfg["num_steps_per_env"]):
-                    actions = self.alg.act(obs)
+                    actions = self.alg.act(obs, dones=dones)
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     if self.cfg.get("check_for_nan", True):
                         check_nan(obs, rewards, dones)

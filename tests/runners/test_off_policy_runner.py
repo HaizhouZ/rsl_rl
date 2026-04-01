@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 
 import torch
+import pytest
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
@@ -47,12 +48,12 @@ def _make_train_cfg() -> dict:
         "obs_groups": {"actor": ["policy"], "critic": ["policy"]},
         "actor": {
             "hidden_dims": [32, 32],
-            "activation": "elu",
+            "activation": "relu",
             "obs_normalization": True,
         },
         "critic": {
             "hidden_dims": [32, 32],
-            "activation": "elu",
+            "activation": "relu",
             "obs_normalization": True,
         },
         "algorithm": {
@@ -60,11 +61,17 @@ def _make_train_cfg() -> dict:
             "batch_size": 8,
             "learning_starts": 0,
             "num_updates": 1,
-            "policy_delay": 1,
-            "exploration_noise": 0.05,
+            "policy_frequency": 1,
             "target_noise": 0.1,
             "noise_clip": 0.2,
-            "learning_rate": 3e-4,
+            "actor_learning_rate": 3e-4,
+            "critic_learning_rate": 3e-4,
+            "weight_decay": 0.0,
+            "num_atoms": 51,
+            "v_min": -10.0,
+            "v_max": 10.0,
+            "use_cdq": True,
+            "reward_normalization": True,
             "replay_size": 128,
         },
     }
@@ -79,3 +86,39 @@ def test_off_policy_runner_learns_and_populates_replay_buffer() -> None:
     assert len(runner.alg.replay_buffer) > 0
     changed = any(not torch.equal(before[key], value) for key, value in runner.alg.actor.state_dict().items())
     assert changed, "Actor parameters should change after a FastTD3 learning step"
+    saved = runner.alg.save()
+    assert "actor_state_dict" in saved
+    assert "critic1_state_dict" in saved
+    assert "critic2_state_dict" in saved
+    assert "critic1_target_state_dict" in saved
+    assert "critic2_target_state_dict" in saved
+    assert "replay_buffer_state_dict" in saved
+    assert "reward_normalizer_state_dict" in saved
+    assert "actor_target_state_dict" not in saved
+
+
+def test_fast_td3_rejects_legacy_checkpoint_shape() -> None:
+    runner = OffPolicyRunner(DummyEnv(), _make_train_cfg(), log_dir=None, device="cpu")
+    legacy_checkpoint = {
+        "model_state_dict": copy.deepcopy(runner.alg.actor.state_dict()),
+        "optimizer_state_dict": copy.deepcopy(runner.alg.actor_optimizer.state_dict()),
+        "iter": 0,
+        "infos": {},
+    }
+
+    with pytest.raises(KeyError, match="actor_state_dict"):
+        runner.alg.load(
+            legacy_checkpoint,
+        {
+            "actor": True,
+            "critic1": True,
+            "critic2": True,
+            "critic1_target": True,
+            "critic2_target": True,
+            "actor_optimizer": True,
+            "critic_optimizer": True,
+                "replay_buffer": True,
+                "iteration": True,
+            },
+            strict=True,
+        )

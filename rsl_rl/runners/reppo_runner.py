@@ -41,18 +41,18 @@ class ReppoRunner:
 
         policy_cfg = dict(self.cfg["policy"])
         algorithm_cfg = self.cfg["algorithm"]
-        self.num_learning_epochs = algorithm_cfg.get("num_learning_epochs", 5)
-        self.num_mini_batches = algorithm_cfg.get("num_mini_batches", 4)
-        self.learning_rate = algorithm_cfg.get("learning_rate", 1e-3)
+        self.num_learning_epochs = algorithm_cfg.get("num_learning_epochs", 4)
+        self.num_mini_batches = algorithm_cfg.get("num_mini_batches", 32)
+        self.learning_rate = algorithm_cfg.get("learning_rate", 3e-4)
         self.gamma = algorithm_cfg.get("gamma", 0.99)
         self.lmbda = algorithm_cfg.get("lmbda", algorithm_cfg.get("lam", 0.95))
-        self.num_atoms = algorithm_cfg.get("num_atoms", 101)
-        self.vmin = algorithm_cfg.get("vmin", -5.0)
-        self.vmax = algorithm_cfg.get("vmax", 5.0)
-        self.aux_loss_mult = algorithm_cfg.get("aux_loss_mult", 1.0)
-        self.kl_bound = algorithm_cfg.get("kl_bound", algorithm_cfg.get("desired_kl", 0.01))
-        self.actor_kl_clip_mode = algorithm_cfg.get("actor_kl_clip_mode", "full")
-        self.ent_target_mult = algorithm_cfg.get("ent_target_mult", -0.5)
+        self.num_atoms = algorithm_cfg.get("num_atoms", 151)
+        self.vmin = algorithm_cfg.get("vmin", 0.0)
+        self.vmax = algorithm_cfg.get("vmax", 150.0)
+        self.aux_loss_mult = algorithm_cfg.get("aux_loss_mult", 0.0)
+        self.kl_bound = algorithm_cfg.get("kl_bound", algorithm_cfg.get("desired_kl", 0.1))
+        self.actor_kl_clip_mode = algorithm_cfg.get("actor_kl_clip_mode", "clipped")
+        self.ent_target_mult = algorithm_cfg.get("ent_target_mult", 0.5)
         policy_class = resolve_callable(policy_cfg.pop("class_name", "ReppoPolicy"))  # type: ignore
         critic_class = resolve_callable(policy_cfg.pop("critic_class_name", "ReppoCritic"))  # type: ignore
 
@@ -70,7 +70,7 @@ class ReppoRunner:
         self.policy_old = copy.deepcopy(self.policy).to(self.device)
         self.policy_old.eval()
 
-        optimizer_name = algorithm_cfg.get("optimizer", "adam")
+        optimizer_name = algorithm_cfg.get("optimizer", "adamw")
         self.actor_optimizer = resolve_optimizer(optimizer_name)(self.policy.parameters(), lr=self.learning_rate)
         self.critic_optimizer = resolve_optimizer(optimizer_name)(
             self.critic.parameters(), lr=self.learning_rate

@@ -52,11 +52,13 @@ When touching REPPO code, check at least:
 - [x] Add an off-policy runner under `rsl_rl/runners/`.
 - [x] Add actor/critic wrappers if the existing `MLPModel` is not sufficient.
 - [x] Export the new public classes from package `__init__` files.
-- [ ] Add FastTD3-specific config handling.
+- [x] Add FastTD3-specific config handling.
+- [x] Keep FastTD3 checkpoint loading strict to native state_dict keys.
+- [x] Bring FastTD3 behavior closer to the reference distributional critic / actor-noise path.
 
 ### `mjlab2` integration
-- [ ] Add one task config that selects the FastTD3 runner.
-- [ ] Keep any legacy config or checkpoint translation in `mjlab2`.
+- [x] Add one task config that selects the FastTD3 runner.
+- [x] Keep any legacy config or checkpoint translation in `mjlab2`.
 - [ ] Avoid touching the main `mjlab2` training script unless a hard compatibility gap appears.
 
 ### Validation
@@ -71,3 +73,7 @@ When touching REPPO code, check at least:
 - 2026-04-01: Replay buffer implemented in `rsl_rl/storage/replay_buffer.py` and covered by `tests/storage/test_replay_buffer.py`.
 - 2026-04-01: Added FastTD3 actor/critic wrappers, algorithm scaffold, and off-policy runner under `rsl_rl`.
 - 2026-04-01: FastTD3 smoke test passes on the dummy env path. Remaining work is config wiring and parity tightening.
+- 2026-04-01: FastTD3 config handling now requires native checkpoint keys and rejects legacy fallback shapes.
+- 2026-04-01: FastTD3 updated to use distributional critics, reference-style exploration noise, and clipped-double-Q actor updates.
+- 2026-04-01: Parity pass aligned the FastTD3 actor/critic defaults with the reference architecture and added optional reward normalization support.
+- 2026-04-01: FastTD3 now supports n-step replay sampling and cosine LR schedules, and REPPO defaults were aligned with the reference TorchRL config.

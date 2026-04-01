@@ -9,13 +9,46 @@ import copy
 from collections import defaultdict
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
 from rsl_rl.models import FastTD3Actor, FastTD3Critic
+from rsl_rl.modules import EmpiricalNormalization
 from rsl_rl.storage import TensorDictReplayBuffer
 from rsl_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
+
+
+class RewardNormalizer(nn.Module):
+    """Reward scale normalizer matching the reference FastTD3 behavior."""
+
+    def __init__(
+        self,
+        num_envs: int,
+        gamma: float,
+        device: str,
+        g_max: float = 10.0,
+        epsilon: float = 1e-8,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("G", torch.zeros(num_envs, device=device))
+        self.register_buffer("G_r_max", torch.zeros(1, device=device))
+        self.G_rms = EmpiricalNormalization(shape=1).to(device)
+        self.gamma = gamma
+        self.g_max = g_max
+        self.epsilon = epsilon
+
+    def update_stats(self, rewards: torch.Tensor, dones: torch.Tensor) -> None:
+        self.G.copy_(self.gamma * (1.0 - dones) * self.G + rewards)
+        self.G_rms.update(self.G.view(-1, 1))
+        self.G_r_max.copy_(torch.maximum(self.G_r_max, self.G.abs().max().view(1)))
+
+    def forward(self, rewards: torch.Tensor) -> torch.Tensor:
+        var_denominator = self.G_rms.std[0] + self.epsilon
+        min_required_denominator = self.G_r_max / self.g_max
+        denominator = torch.maximum(var_denominator, min_required_denominator)
+        return rewards / denominator
 
 
 class FastTD3:
@@ -30,7 +63,6 @@ class FastTD3:
         critic2: FastTD3Critic,
         replay_buffer: TensorDictReplayBuffer,
         *,
-        actor_target: FastTD3Actor,
         critic1_target: FastTD3Critic,
         critic2_target: FastTD3Critic,
         batch_size: int = 256,
@@ -38,57 +70,93 @@ class FastTD3:
         num_updates: int = 1,
         gamma: float = 0.99,
         tau: float = 0.005,
-        policy_delay: int = 2,
-        exploration_noise: float = 0.1,
+        policy_frequency: int = 2,
         target_noise: float = 0.2,
         noise_clip: float = 0.5,
-        learning_rate: float = 3e-4,
+        actor_learning_rate: float = 3e-4,
+        actor_learning_rate_end: float | None = None,
+        critic_learning_rate: float = 3e-4,
+        critic_learning_rate_end: float | None = None,
+        weight_decay: float = 0.1,
         max_grad_norm: float = 1.0,
         optimizer: str = "adamw",
+        use_cdq: bool = True,
+        reward_normalization: bool = False,
+        scheduler_steps: int | None = None,
         device: str = "cpu",
     ) -> None:
         self.device = device
         self.actor = actor.to(self.device)
         self.critic1 = critic1.to(self.device)
         self.critic2 = critic2.to(self.device)
-        self.actor_target = actor_target.to(self.device)
+        self.policy = self.actor
+        self.critic = self.critic1
         self.critic1_target = critic1_target.to(self.device)
         self.critic2_target = critic2_target.to(self.device)
         self.replay_buffer = replay_buffer
 
-        self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic1_target.load_state_dict(self.critic1.state_dict())
         self.critic2_target.load_state_dict(self.critic2.state_dict())
-        self.actor_target.eval()
         self.critic1_target.eval()
         self.critic2_target.eval()
 
         optimizer_cls = resolve_optimizer(optimizer)
-        self.actor_optimizer = optimizer_cls(self.actor.parameters(), lr=learning_rate)
+        self.actor_optimizer = optimizer_cls(
+            self.actor.parameters(), lr=actor_learning_rate, weight_decay=weight_decay
+        )
         critic_params = list(self.critic1.parameters()) + list(self.critic2.parameters())
-        self.critic_optimizer = optimizer_cls(critic_params, lr=learning_rate)
+        self.critic_optimizer = optimizer_cls(
+            critic_params, lr=critic_learning_rate, weight_decay=weight_decay
+        )
+        self.actor_scheduler = None
+        self.critic_scheduler = None
+        if scheduler_steps is not None and scheduler_steps > 0:
+            actor_lr_end = actor_learning_rate if actor_learning_rate_end is None else actor_learning_rate_end
+            critic_lr_end = critic_learning_rate if critic_learning_rate_end is None else critic_learning_rate_end
+            self.actor_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.actor_optimizer,
+                T_max=scheduler_steps,
+                eta_min=actor_lr_end,
+            )
+            self.critic_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.critic_optimizer,
+                T_max=scheduler_steps,
+                eta_min=critic_lr_end,
+            )
 
         self.batch_size = batch_size
         self.learning_starts = learning_starts
         self.num_updates = num_updates
         self.gamma = gamma
         self.tau = tau
-        self.policy_delay = policy_delay
-        self.exploration_noise = exploration_noise
+        self.policy_frequency = policy_frequency
         self.target_noise = target_noise
         self.noise_clip = noise_clip
         self.max_grad_norm = max_grad_norm
-        self.learning_rate = learning_rate
+        self.learning_rate = critic_learning_rate
+        self.use_cdq = use_cdq
+        self.reward_normalizer = (
+            RewardNormalizer(
+                self.actor.n_envs,
+                gamma=self.gamma,
+                device=self.device,
+                g_max=min(abs(self.critic1.v_min), abs(self.critic1.v_max)),
+            )
+            if reward_normalization
+            else None
+        )
         self.update_step = 0
         self.pending_transition: TensorDict | None = None
 
-    def act(self, obs: TensorDict) -> torch.Tensor:
+    def act(self, obs: TensorDict, dones: torch.Tensor | None = None) -> torch.Tensor:
         with torch.inference_mode():
-            actions = self.actor(obs)
-            if self.actor.training and self.exploration_noise > 0:
-                noise = torch.randn_like(actions) * self.exploration_noise
-                actions = (actions + noise).clamp(-1.0, 1.0)
-        self.pending_transition = TensorDict({"observations": obs.clone(), "actions": actions.clone()}, batch_size=obs.batch_size)
+            if self.actor.training:
+                actions = self.actor.explore(obs, dones=dones)
+            else:
+                actions = self.actor(obs)
+        self.pending_transition = TensorDict(
+            {"observations": obs.clone(), "actions": actions.clone()}, batch_size=obs.batch_size
+        )
         return actions
 
     def process_env_step(
@@ -100,6 +168,8 @@ class FastTD3:
         self.actor.update_normalization(self.pending_transition["observations"])
         self.critic1.update_normalization(self.pending_transition["observations"])
         self.critic2.update_normalization(self.pending_transition["observations"])
+        if self.reward_normalizer is not None:
+            self.reward_normalizer.update_stats(rewards, dones.float())
 
         truncations = extras.get("time_outs")
         if truncations is None:
@@ -115,6 +185,7 @@ class FastTD3:
                         "rewards": rewards.clone().unsqueeze(-1).to(dtype=torch.float32),
                         "dones": dones.clone().unsqueeze(-1).to(dtype=torch.float32),
                         "truncations": truncations.clone().unsqueeze(-1).to(dtype=torch.float32),
+                        "effective_n_steps": torch.ones_like(rewards, dtype=torch.float32).unsqueeze(-1),
                     },
                     batch_size=obs.batch_size,
                 ),
@@ -140,23 +211,44 @@ class FastTD3:
             rewards = batch["next"]["rewards"]
             dones = batch["next"]["dones"]
             truncations = batch["next"]["truncations"]
+            effective_n_steps = batch["next"].get(
+                "effective_n_steps", torch.ones_like(rewards, dtype=torch.float32)
+            )
+            if self.reward_normalizer is not None:
+                rewards = self.reward_normalizer(rewards)
             bootstrap = torch.logical_or(~dones.bool(), truncations.bool()).float()
+            discount = torch.full_like(effective_n_steps, self.gamma, dtype=torch.float32).pow(
+                effective_n_steps.to(dtype=torch.float32)
+            )
 
             with torch.no_grad():
-                target_actions = self.actor_target(next_obs)
+                target_actions = self.actor(next_obs)
                 if self.target_noise > 0:
                     noise = (torch.randn_like(target_actions) * self.target_noise).clamp(
                         -self.noise_clip, self.noise_clip
                     )
                     target_actions = (target_actions + noise).clamp(-1.0, 1.0)
-                target_q1 = self.critic1_target(next_obs, target_actions)
-                target_q2 = self.critic2_target(next_obs, target_actions)
-                target_q = torch.minimum(target_q1, target_q2)
-                target = rewards + self.gamma * bootstrap * target_q
+                target_q1 = self.critic1_target.projection(
+                    next_obs, target_actions, rewards, bootstrap, discount
+                )
+                target_q2 = self.critic2_target.projection(
+                    next_obs, target_actions, rewards, bootstrap, discount
+                )
+                target_q1_value = self.critic1_target.get_value(target_q1)
+                target_q2_value = self.critic2_target.get_value(target_q2)
+                if self.use_cdq:
+                    target_q = torch.where(
+                        target_q1_value.unsqueeze(-1) < target_q2_value.unsqueeze(-1),
+                        target_q1,
+                        target_q2,
+                    )
+                    target_q1 = target_q2 = target_q
 
             q1 = self.critic1(actor_obs, actions)
             q2 = self.critic2(actor_obs, actions)
-            critic_loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
+            q1_loss = -(target_q1 * F.log_softmax(q1, dim=-1)).sum(dim=-1).mean()
+            q2_loss = -(target_q2 * F.log_softmax(q2, dim=-1)).sum(dim=-1).mean()
+            critic_loss = q1_loss + q2_loss
 
             self.critic_optimizer.zero_grad(set_to_none=True)
             critic_loss.backward()
@@ -166,26 +258,41 @@ class FastTD3:
                     self.max_grad_norm,
                 )
             self.critic_optimizer.step()
+            if self.critic_scheduler is not None:
+                self.critic_scheduler.step()
 
             logs["critic_loss"].append(float(critic_loss.detach()))
-            logs["q1_mean"].append(float(q1.mean().detach()))
-            logs["q2_mean"].append(float(q2.mean().detach()))
+            logs["q1_mean"].append(float(self.critic1.get_value(F.softmax(q1, dim=-1)).mean().detach()))
+            logs["q2_mean"].append(float(self.critic2.get_value(F.softmax(q2, dim=-1)).mean().detach()))
 
-            if self.update_step % self.policy_delay == 0:
+            if self.update_step % self.policy_frequency == 0:
                 actor_actions = self.actor(actor_obs)
-                actor_loss = -self.critic1(actor_obs, actor_actions).mean()
+                q1_actor = self.critic1(actor_obs, actor_actions)
+                q2_actor = self.critic2(actor_obs, actor_actions)
+                q1_actor_value = self.critic1.get_value(F.softmax(q1_actor, dim=-1))
+                q2_actor_value = self.critic2.get_value(F.softmax(q2_actor, dim=-1))
+                if self.use_cdq:
+                    actor_value = torch.minimum(q1_actor_value, q2_actor_value)
+                else:
+                    actor_value = (q1_actor_value + q2_actor_value) / 2.0
+                actor_loss = -actor_value.mean()
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 actor_loss.backward()
                 if self.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 self.actor_optimizer.step()
+                if self.actor_scheduler is not None:
+                    self.actor_scheduler.step()
                 logs["actor_loss"].append(float(actor_loss.detach()))
 
-                self._soft_update(self.actor_target, self.actor, self.tau)
+                self._soft_update(self.critic1_target, self.critic1, self.tau)
+                self._soft_update(self.critic2_target, self.critic2, self.tau)
+            else:
                 self._soft_update(self.critic1_target, self.critic1, self.tau)
                 self._soft_update(self.critic2_target, self.critic2, self.tau)
 
             self.update_step += 1
+            self.learning_rate = self.critic_optimizer.param_groups[0]["lr"]
 
         return {key: sum(values) / len(values) for key, values in logs.items() if values}
 
@@ -193,48 +300,77 @@ class FastTD3:
         self.actor.train()
         self.critic1.train()
         self.critic2.train()
+        if self.reward_normalizer is not None:
+            self.reward_normalizer.train()
 
     def eval_mode(self) -> None:
         self.actor.eval()
         self.critic1.eval()
         self.critic2.eval()
+        if self.reward_normalizer is not None:
+            self.reward_normalizer.eval()
 
     def save(self) -> dict:
         return {
             "actor_state_dict": self.actor.state_dict(),
             "critic1_state_dict": self.critic1.state_dict(),
             "critic2_state_dict": self.critic2.state_dict(),
-            "actor_target_state_dict": self.actor_target.state_dict(),
             "critic1_target_state_dict": self.critic1_target.state_dict(),
             "critic2_target_state_dict": self.critic2_target.state_dict(),
             "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
             "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
             "replay_buffer_state_dict": self.replay_buffer.state_dict(),
             "update_step": self.update_step,
+            **(
+                {"reward_normalizer_state_dict": self.reward_normalizer.state_dict()}
+                if self.reward_normalizer is not None
+                else {}
+            ),
         }
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
-        if "actor_state_dict" in loaded_dict:
+        load_cfg = load_cfg or {}
+        if load_cfg.get("actor", True):
+            if "actor_state_dict" not in loaded_dict:
+                raise KeyError("FastTD3 checkpoint is missing 'actor_state_dict'.")
             self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
-        if "critic1_state_dict" in loaded_dict:
+        if load_cfg.get("critic1", True):
+            if "critic1_state_dict" not in loaded_dict:
+                raise KeyError("FastTD3 checkpoint is missing 'critic1_state_dict'.")
             self.critic1.load_state_dict(loaded_dict["critic1_state_dict"], strict=strict)
-        if "critic2_state_dict" in loaded_dict:
+        if load_cfg.get("critic2", True):
+            if "critic2_state_dict" not in loaded_dict:
+                raise KeyError("FastTD3 checkpoint is missing 'critic2_state_dict'.")
             self.critic2.load_state_dict(loaded_dict["critic2_state_dict"], strict=strict)
-        if "actor_target_state_dict" in loaded_dict:
-            self.actor_target.load_state_dict(loaded_dict["actor_target_state_dict"], strict=strict)
-        if "critic1_target_state_dict" in loaded_dict:
+        if load_cfg.get("critic1_target", True):
+            if "critic1_target_state_dict" not in loaded_dict:
+                raise KeyError("FastTD3 checkpoint is missing 'critic1_target_state_dict'.")
             self.critic1_target.load_state_dict(loaded_dict["critic1_target_state_dict"], strict=strict)
-        if "critic2_target_state_dict" in loaded_dict:
+        if load_cfg.get("critic2_target", True):
+            if "critic2_target_state_dict" not in loaded_dict:
+                raise KeyError("FastTD3 checkpoint is missing 'critic2_target_state_dict'.")
             self.critic2_target.load_state_dict(loaded_dict["critic2_target_state_dict"], strict=strict)
-        if "actor_optimizer_state_dict" in loaded_dict:
+        if load_cfg.get("actor_optimizer", True):
+            if "actor_optimizer_state_dict" not in loaded_dict:
+                raise KeyError("FastTD3 checkpoint is missing 'actor_optimizer_state_dict'.")
             self.actor_optimizer.load_state_dict(loaded_dict["actor_optimizer_state_dict"])
-        if "critic_optimizer_state_dict" in loaded_dict:
+        if load_cfg.get("critic_optimizer", True):
+            if "critic_optimizer_state_dict" not in loaded_dict:
+                raise KeyError("FastTD3 checkpoint is missing 'critic_optimizer_state_dict'.")
             self.critic_optimizer.load_state_dict(loaded_dict["critic_optimizer_state_dict"])
-        if "replay_buffer_state_dict" in loaded_dict:
+        if load_cfg.get("replay_buffer", True):
+            if "replay_buffer_state_dict" not in loaded_dict:
+                raise KeyError("FastTD3 checkpoint is missing 'replay_buffer_state_dict'.")
             self.replay_buffer.load_state_dict(loaded_dict["replay_buffer_state_dict"])
-        if "update_step" in loaded_dict:
+        if self.reward_normalizer is not None and load_cfg.get("reward_normalizer", True):
+            if "reward_normalizer_state_dict" not in loaded_dict:
+                raise KeyError("FastTD3 checkpoint is missing 'reward_normalizer_state_dict'.")
+            self.reward_normalizer.load_state_dict(loaded_dict["reward_normalizer_state_dict"])
+        if load_cfg.get("iteration", True):
+            if "update_step" not in loaded_dict:
+                raise KeyError("FastTD3 checkpoint is missing 'update_step'.")
             self.update_step = int(loaded_dict["update_step"])
-        return "update_step" in loaded_dict
+        return bool(load_cfg.get("iteration", True))
 
     def get_policy(self) -> FastTD3Actor:
         return self.actor
@@ -261,42 +397,82 @@ class FastTD3:
             replay_size = algorithm_cfg.pop("buffer_size", 100_000)
         else:
             algorithm_cfg.pop("buffer_size", None)
-        replay_buffer = TensorDictReplayBuffer(replay_size, device="cpu")
 
+        legacy_learning_rate = algorithm_cfg.pop("learning_rate", 3e-4)
+        actor_learning_rate = algorithm_cfg.pop("actor_learning_rate", legacy_learning_rate)
+        actor_learning_rate_end = algorithm_cfg.pop("actor_learning_rate_end", actor_learning_rate)
+        critic_learning_rate = algorithm_cfg.pop("critic_learning_rate", actor_learning_rate)
+        critic_learning_rate_end = algorithm_cfg.pop("critic_learning_rate_end", critic_learning_rate)
+        weight_decay = algorithm_cfg.pop("weight_decay", 0.1)
+        policy_frequency = algorithm_cfg.pop("policy_frequency", algorithm_cfg.pop("policy_delay", 2))
+        use_cdq = algorithm_cfg.pop("use_cdq", True)
+        reward_normalization = algorithm_cfg.pop("reward_normalization", False)
+        n_steps = algorithm_cfg.pop("n_steps", 1)
+        num_atoms = algorithm_cfg.pop("num_atoms", 101)
+        v_min = algorithm_cfg.pop("v_min", -250.0)
+        v_max = algorithm_cfg.pop("v_max", 250.0)
+        algorithm_cfg.pop("exploration_noise", None)
+
+        actor_kwargs = dict(cfg["actor"])
+        actor_kwargs.setdefault("init_scale", 0.01)
+        actor_kwargs.setdefault("std_min", 0.05)
+        actor_kwargs.setdefault("std_max", 0.8)
         actor: FastTD3Actor = actor_class(
             obs,
             cfg["obs_groups"],
             "actor",
             env.num_actions,
-            **cfg["actor"],
+            env.num_envs,
+            **actor_kwargs,
         ).to(device)
+        critic_kwargs = dict(cfg["critic"])
+        critic_kwargs.setdefault("num_atoms", num_atoms)
+        critic_kwargs.setdefault("v_min", v_min)
+        critic_kwargs.setdefault("v_max", v_max)
         critic1: FastTD3Critic = critic_class(
             obs,
             cfg["obs_groups"],
             "critic",
             env.num_actions,
-            **cfg["critic"],
+            **critic_kwargs,
         ).to(device)
         critic2: FastTD3Critic = critic_class(
             obs,
             cfg["obs_groups"],
             "critic",
             env.num_actions,
-            **copy.deepcopy(cfg["critic"]),
+            **copy.deepcopy(critic_kwargs),
         ).to(device)
+
+        replay_buffer = TensorDictReplayBuffer(
+            replay_size,
+            device="cpu",
+            num_envs=env.num_envs,
+            n_steps=n_steps,
+            gamma=algorithm_cfg.get("gamma", 0.99),
+        )
 
         algorithm_cfg.setdefault("batch_size", min(256, replay_size))
         algorithm_cfg.setdefault("learning_starts", min(1_000, replay_size))
         algorithm_cfg.setdefault("num_updates", 1)
         algorithm_cfg.setdefault("gamma", 0.99)
         algorithm_cfg.setdefault("tau", 0.005)
-        algorithm_cfg.setdefault("policy_delay", 2)
-        algorithm_cfg.setdefault("exploration_noise", 0.1)
         algorithm_cfg.setdefault("target_noise", 0.2)
         algorithm_cfg.setdefault("noise_clip", 0.5)
-        algorithm_cfg.setdefault("learning_rate", 3e-4)
+        algorithm_cfg.setdefault("policy_frequency", policy_frequency)
+        algorithm_cfg.setdefault("actor_learning_rate", actor_learning_rate)
+        algorithm_cfg.setdefault("actor_learning_rate_end", actor_learning_rate_end)
+        algorithm_cfg.setdefault("critic_learning_rate", critic_learning_rate)
+        algorithm_cfg.setdefault("critic_learning_rate_end", critic_learning_rate_end)
+        algorithm_cfg.setdefault("weight_decay", weight_decay)
         algorithm_cfg.setdefault("max_grad_norm", 1.0)
         algorithm_cfg.setdefault("optimizer", "adamw")
+        algorithm_cfg.setdefault("use_cdq", use_cdq)
+        algorithm_cfg.setdefault("reward_normalization", reward_normalization)
+        algorithm_cfg.setdefault(
+            "scheduler_steps",
+            max(1, int(cfg.get("max_iterations", 1)) * int(algorithm_cfg.get("num_updates", 1))),
+        )
         algorithm_cfg.pop("rnd_cfg", None)
         algorithm_cfg.pop("symmetry_cfg", None)
         algorithm_cfg.pop("multi_gpu_cfg", None)
@@ -306,7 +482,6 @@ class FastTD3:
             critic1,
             critic2,
             replay_buffer,
-            actor_target=copy.deepcopy(actor),
             critic1_target=copy.deepcopy(critic1),
             critic2_target=copy.deepcopy(critic2),
             device=device,
