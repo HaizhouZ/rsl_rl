@@ -65,7 +65,9 @@ class OffPolicyRunner:
         total_it = start_it + num_learning_iterations
         for it in range(start_it, total_it):
             start = time.time()
-            with torch.inference_mode():
+            # FastTD3 updates normalization buffers during rollout collection, so use no_grad
+            # instead of inference_mode to keep checkpoint state reloadable in-process.
+            with torch.no_grad():
                 for _ in range(self.cfg["num_steps_per_env"]):
                     actions = self.alg.act(obs, dones=dones)
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))

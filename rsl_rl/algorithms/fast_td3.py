@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 from collections import defaultdict
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
@@ -312,7 +313,8 @@ class FastTD3:
             self.reward_normalizer.eval()
 
     def save(self) -> dict:
-        return {
+        return self._clone_checkpoint_tensors(
+            {
             "actor_state_dict": self.actor.state_dict(),
             "critic1_state_dict": self.critic1.state_dict(),
             "critic2_state_dict": self.critic2.state_dict(),
@@ -327,7 +329,8 @@ class FastTD3:
                 if self.reward_normalizer is not None
                 else {}
             ),
-        }
+            }
+        )
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
         load_cfg = load_cfg or {}
@@ -495,3 +498,17 @@ class FastTD3:
         for target_param, source_param in zip(target.parameters(), source.parameters()):
             target_param.data.mul_(1.0 - tau)
             target_param.data.add_(tau * source_param.data)
+
+    @classmethod
+    def _clone_checkpoint_tensors(cls, value):
+        if isinstance(value, torch.Tensor):
+            return value.clone()
+        if isinstance(value, TensorDict):
+            return value.clone()
+        if isinstance(value, Mapping):
+            return {key: cls._clone_checkpoint_tensors(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(cls._clone_checkpoint_tensors(item) for item in value)
+        if isinstance(value, list):
+            return [cls._clone_checkpoint_tensors(item) for item in value]
+        return value
