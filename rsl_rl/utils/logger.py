@@ -50,7 +50,7 @@ class Logger:
         self.cur_episode_length = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
         # Create RND buffers
-        if self.cfg["algorithm"]["rnd_cfg"]:
+        if self.cfg["algorithm"].get("rnd_cfg"):
             self.erewbuffer = deque(maxlen=100)
             self.irewbuffer = deque(maxlen=100)
             self.cur_ereward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)

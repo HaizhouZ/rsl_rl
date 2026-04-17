@@ -11,7 +11,7 @@ from tensordict import TensorDict
 from torch.distributions import Normal, TransformedDistribution
 from torch.distributions.transforms import Transform
 
-from rsl_rl.modules import EmpiricalNormalization, MLP
+from rsl_rl.modules import EmpiricalNormalization
 
 
 class TanhTransform(Transform):
@@ -74,6 +74,72 @@ class _DeterministicActor(nn.Module):
         return self.mean_net[idx]
 
 
+class _ActorMeanHead(nn.Module):
+    def __init__(self, actor_model: nn.Module, num_actions: int) -> None:
+        super().__init__()
+        self.actor_model = actor_model
+        self.num_actions = num_actions
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        mean, _ = torch.split(self.actor_model(obs), self.num_actions, dim=-1)
+        return mean
+
+    def __getitem__(self, idx: int) -> nn.Module:
+        if hasattr(self.actor_model, "net"):
+            return self.actor_model.net[idx]  # type: ignore[index]
+        raise TypeError("Underlying actor model does not support indexing")
+
+
+def _resolve_hidden_dims(
+    explicit_dims: tuple[int, ...] | list[int] | None,
+    fallback_hidden_dim: int,
+    fallback_layers: int,
+) -> tuple[int, ...]:
+    if explicit_dims is not None and len(explicit_dims) > 0:
+        return tuple(explicit_dims)
+    return tuple([fallback_hidden_dim] * fallback_layers)
+
+
+def _activation(name: str | None) -> nn.Module:
+    if name in ("swish", "silu"):
+        return nn.SiLU()
+    if name == "relu":
+        return nn.ReLU()
+    if name == "elu":
+        return nn.ELU()
+    if name is None:
+        return nn.Identity()
+    raise ValueError(f"Unsupported REPPO activation: {name}")
+
+
+class _FCNN(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dims: tuple[int, ...] | list[int],
+        activation: str = "swish",
+        use_norm: bool = True,
+        input_activation: bool = False,
+    ) -> None:
+        super().__init__()
+        layers: list[nn.Module] = []
+        prev_dim = input_dim
+        if input_activation:
+            layers.append(_activation(activation))
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            if use_norm:
+                layers.append(nn.RMSNorm(hidden_dim))
+            layers.append(_activation(activation))
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, output_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 def _concat_obs(obs: TensorDict, obs_groups: list[str]) -> torch.Tensor:
     obs_list = [obs[obs_group] for obs_group in obs_groups]
     return torch.cat(obs_list, dim=-1)
@@ -103,6 +169,9 @@ class ReppoPolicy(nn.Module):
         actor_min_std: float = 0.0,
         ent_start: float = 0.01,
         kl_start: float = 0.01,
+        actor_hidden_dim: int = 512,
+        num_actor_layers: int = 3,
+        use_actor_norm: bool = True,
         **kwargs: dict,
     ) -> None:
         super().__init__()
@@ -131,20 +200,20 @@ class ReppoPolicy(nn.Module):
         else:
             self.critic_obs_normalizer = torch.nn.Identity()
 
-        self.actor_mean = MLP(self.actor_obs_dim, num_actions, actor_hidden_dims, activation=activation)
-        self.actor_mean.init_weights(1.0)
+        actor_hidden_dims = _resolve_hidden_dims(actor_hidden_dims, actor_hidden_dim, num_actor_layers)
+        self.actor_model = _FCNN(
+            self.actor_obs_dim,
+            2 * num_actions,
+            actor_hidden_dims,
+            activation=activation if activation is not None else "swish",
+            use_norm=use_actor_norm,
+        )
+        self.actor_mean = _ActorMeanHead(self.actor_model, num_actions)
         self.actor = _DeterministicActor(self.actor_mean)
 
-        self.noise_std_type = noise_std_type
         self.actor_min_std = actor_min_std
-        if noise_std_type == "scalar":
-            self.std_param = nn.Parameter(init_noise_std * torch.ones(num_actions))
-        elif noise_std_type == "log":
-            self.log_std_param = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
-        else:
-            raise ValueError(
-                f"Unknown standard deviation type: {noise_std_type}. Should be 'scalar' or 'log'."
-            )
+        self.init_noise_std = init_noise_std
+        self.register_buffer("_cached_output_std", init_noise_std * torch.ones(num_actions))
 
         self.log_temp = nn.Parameter(torch.log(torch.tensor(ent_start)))
         self.log_lagrange = nn.Parameter(torch.log(torch.tensor(kl_start)))
@@ -177,30 +246,54 @@ class ReppoPolicy(nn.Module):
         if self.critic_obs_normalization:
             self.critic_obs_normalizer.update(self.get_critic_obs(obs))  # type: ignore
 
-    def _get_std(self, mean: torch.Tensor) -> torch.Tensor:
-        if self.noise_std_type == "scalar":
-            std = self.std_param.expand_as(mean)
-        else:
-            std = torch.exp(self.log_std_param).expand_as(mean)
-        return std + self.actor_min_std
+    def normalize_actor_obs(self, obs: TensorDict | torch.Tensor) -> torch.Tensor:
+        return self.actor_obs_normalizer(self.get_actor_obs(obs))
+
+    def normalize_critic_obs(self, obs: TensorDict | torch.Tensor) -> torch.Tensor:
+        return self.critic_obs_normalizer(self.get_critic_obs(obs))
+
+    @property
+    def num_actions(self) -> int:
+        return self._cached_output_std.shape[-1]
+
+    def _distribution_from_normalized(
+        self, normalized_obs: torch.Tensor
+    ) -> tuple[TransformedDistribution, torch.Tensor, torch.Tensor, torch.Tensor]:
+        out = self.actor_model(normalized_obs)
+        mean, log_std = torch.split(out, out.shape[-1] // 2, dim=-1)
+        std = torch.exp(log_std) + self.actor_min_std
+        self._cached_output_std.copy_(std.mean(dim=0).detach())
+        dist = TransformedDistribution(Normal(mean, std), [TanhTransform(cache_size=1)])
+        return dist, torch.tanh(mean), torch.exp(self.log_temp), torch.exp(self.log_lagrange)
 
     def build_distribution(self, obs: TensorDict | torch.Tensor) -> TransformedDistribution:
-        actor_obs = self.actor_obs_normalizer(self.get_actor_obs(obs))
-        mean = self.actor_mean(actor_obs)
-        std = self._get_std(mean)
-        return TransformedDistribution(Normal(mean, std), [TanhTransform(cache_size=1)])
+        dist, _, _, _ = self._distribution_from_normalized(self.normalize_actor_obs(obs))
+        return dist
+
+    def build_distribution_from_normalized(self, normalized_obs: torch.Tensor) -> TransformedDistribution:
+        dist, _, _, _ = self._distribution_from_normalized(normalized_obs)
+        return dist
 
     def sample_actions(
-        self, obs: TensorDict | torch.Tensor
+        self, obs: TensorDict | torch.Tensor, normalized: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        actor_obs = self.actor_obs_normalizer(self.get_actor_obs(obs))
-        mean = self.actor_mean(actor_obs)
-        std = self._get_std(mean)
-        dist = TransformedDistribution(Normal(mean, std), [TanhTransform(cache_size=1)])
+        actor_obs = obs if normalized else self.normalize_actor_obs(obs)
+        dist, deterministic_actions, _, _ = self._distribution_from_normalized(actor_obs)
         actions = dist.rsample()
-        log_prob = dist.log_prob(actions).sum(dim=-1)
-        entropy = Normal(mean, std).entropy().sum(dim=-1)
-        return actions, log_prob, entropy, mean
+        clipped_actions = actions.clamp(-1 + 1e-6, 1 - 1e-6)
+        log_prob = dist.log_prob(clipped_actions).sum(dim=-1)
+        entropy = -log_prob
+        return actions, log_prob, entropy, deterministic_actions
+
+    def sample_actions_from_normalized(
+        self, normalized_obs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        dist, deterministic_actions, temperature, beta = self._distribution_from_normalized(normalized_obs)
+        actions = dist.rsample()
+        clipped_actions = actions.clamp(-1 + 1e-6, 1 - 1e-6)
+        log_prob = dist.log_prob(clipped_actions).sum(dim=-1)
+        entropy = -log_prob
+        return actions, log_prob, entropy, deterministic_actions, temperature, beta
 
     def get_actions_log_prob(self, obs: TensorDict | torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         dist = self.build_distribution(obs)
@@ -208,17 +301,14 @@ class ReppoPolicy(nn.Module):
 
     def forward(self, obs: TensorDict | torch.Tensor) -> torch.Tensor:
         """Deterministic inference path used by play/export utilities."""
-        actor_obs = self.actor_obs_normalizer(self.get_actor_obs(obs))
-        return self.actor(actor_obs)
+        return self.actor(self.normalize_actor_obs(obs))
 
     def act_inference(self, obs: TensorDict | torch.Tensor) -> torch.Tensor:
         return self.forward(obs)
 
     @property
     def output_std(self) -> torch.Tensor:
-        if self.noise_std_type == "scalar":
-            return self.std_param.detach().clone()
-        return torch.exp(self.log_std_param.detach().clone()) + self.actor_min_std
+        return self._cached_output_std.detach().clone()
 
 
 class ReppoCritic(nn.Module):
@@ -240,6 +330,12 @@ class ReppoCritic(nn.Module):
         vmin: float = 0.0,
         vmax: float = 150.0,
         aux_loss_mult: float = 0.0,
+        critic_hidden_dim: int = 512,
+        use_critic_norm: bool = True,
+        use_encoder_norm: bool = False,
+        num_critic_encoder_layers: int = 2,
+        num_critic_head_layers: int = 2,
+        num_critic_pred_layers: int = 2,
         **kwargs: dict,
     ) -> None:
         super().__init__()
@@ -265,24 +361,32 @@ class ReppoCritic(nn.Module):
             self.critic_obs_normalizer = torch.nn.Identity()
 
         critic_hidden_dims = hidden_dims if hidden_dims is not None else critic_hidden_dims
-        feature_dim = critic_hidden_dims[0] if critic_hidden_dims else 256
-        self.feature_module = MLP(
+        critic_hidden_dims = _resolve_hidden_dims(critic_hidden_dims, critic_hidden_dim, num_critic_encoder_layers)
+        feature_dim = critic_hidden_dims[-1] if critic_hidden_dims else critic_hidden_dim
+        head_hidden_dims = tuple([feature_dim] * max(0, num_critic_head_layers - 1))
+        pred_hidden_dims = tuple([feature_dim] * max(0, num_critic_pred_layers - 1))
+        self.feature_module = _FCNN(
             self.obs_dim + num_actions,
             feature_dim,
             critic_hidden_dims,
-            activation=activation,
+            activation=activation if activation is not None else "swish",
+            use_norm=use_critic_norm,
         )
-        self.critic_module = MLP(
+        self.critic_module = _FCNN(
             feature_dim,
             num_atoms,
-            critic_hidden_dims,
-            activation=activation,
+            head_hidden_dims,
+            activation=activation if activation is not None else "swish",
+            use_norm=use_critic_norm,
+            input_activation=True,
         )
-        self.pred_module = MLP(
+        self.pred_module = _FCNN(
             feature_dim,
             feature_dim,
-            critic_hidden_dims,
-            activation=activation,
+            pred_hidden_dims,
+            activation=activation if activation is not None else "swish",
+            use_norm=use_critic_norm,
+            input_activation=True,
         )
 
         self.register_buffer(
@@ -308,8 +412,12 @@ class ReppoCritic(nn.Module):
         if self.critic_obs_normalization:
             self.critic_obs_normalizer.update(self.get_critic_obs(obs))  # type: ignore
 
-    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        obs = self.critic_obs_normalizer(obs)
+    def normalize_critic_obs(self, obs: TensorDict | torch.Tensor) -> torch.Tensor:
+        return self.critic_obs_normalizer(self.get_critic_obs(obs) if isinstance(obs, TensorDict) else obs)
+
+    def forward_normalized(
+        self, obs: torch.Tensor, action: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         inp = torch.cat([obs, action], dim=-1)
         features = self.feature_module(inp)
         next_pred = self.pred_module(features)
@@ -317,3 +425,6 @@ class ReppoCritic(nn.Module):
         value_cats = torch.softmax(logits, dim=-1)
         value = value_cats @ self.value_bins
         return value, logits, next_pred, features
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.forward_normalized(self.normalize_critic_obs(obs), action)

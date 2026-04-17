@@ -153,9 +153,12 @@ class ReppoRunner:
         self.logger.stop_logging_writer()
 
     def act(self, obs: TensorDict) -> torch.Tensor:
-        actor_obs = self.policy.get_actor_obs(obs)
-        critic_obs = self.critic.get_critic_obs(obs)
-        actions, log_prob, entropy, _ = self.policy.sample_actions(actor_obs)
+        self.policy.update_normalization(obs)
+        self.critic.update_normalization(obs)
+
+        actor_obs = self.policy.normalize_actor_obs(obs)
+        critic_obs = self.critic.normalize_critic_obs(obs)
+        actions, log_prob, entropy, _, _, _ = self.policy.sample_actions_from_normalized(actor_obs)
         self.pending_transition = {
             "observations": actor_obs.detach(),
             "critic_observations": critic_obs.detach(),
@@ -171,14 +174,26 @@ class ReppoRunner:
         if self.pending_transition is None:
             raise RuntimeError("process_env_step called before act")
 
-        self.policy.update_normalization(obs)
-        self.critic.update_normalization(obs)
+        effective_next_obs = obs
+        if (
+            self.cfg.get("env", {}).get("has_final_obs", False)
+            and self.cfg.get("env", {}).get("partial_reset", False)
+            and "final_observation" in extras
+        ):
+            maybe_final_obs = extras["final_observation"]
+            if isinstance(maybe_final_obs, TensorDict):
+                effective_next_obs = maybe_final_obs
 
         with torch.inference_mode():
-            next_actor_obs = self.policy.get_actor_obs(obs)
-            next_critic_obs = self.critic.get_critic_obs(obs)
-            next_actions, _, _, _ = self.policy.sample_actions(next_actor_obs)
-            next_value, _, next_pred, next_embedding = self.critic(next_critic_obs, next_actions)
+            self.policy.update_normalization(effective_next_obs)
+            self.critic.update_normalization(effective_next_obs)
+            next_actor_obs = self.policy.normalize_actor_obs(effective_next_obs)
+            next_critic_obs = self.critic.normalize_critic_obs(effective_next_obs)
+            next_actions, next_log_probs, _, _, temperature, _ = self.policy.sample_actions_from_normalized(
+                next_actor_obs
+            )
+            next_value, _, next_pred, next_embedding = self.critic.forward_normalized(next_critic_obs, next_actions)
+            rewards = rewards - self.gamma * next_log_probs * temperature
 
         truncations = extras.get("time_outs")
         if truncations is None:
@@ -265,7 +280,7 @@ class ReppoRunner:
                     self.num_atoms,
                 )
 
-                _, logits, _, embedding = self.critic(batch_critic_obs, batch_actions)
+                _, logits, _, embedding = self.critic.forward_normalized(batch_critic_obs, batch_actions)
                 qf_loss = -(
                     batch_mask * torch.sum(qf_target_dist * F.log_softmax(logits, dim=-1), dim=-1)
                 ).mean()
@@ -278,30 +293,31 @@ class ReppoRunner:
                 self.critic_optimizer.zero_grad(set_to_none=True)
                 critic_loss.backward()
                 if self.is_distributed:
-                    self.reduce_parameters()
+                    self.reduce_parameters(self.critic.parameters())
                 torch.nn.utils.clip_grad_norm_(
                     self.critic.parameters(), self.cfg["algorithm"].get("max_grad_norm", 1.0)
                 )
                 self.critic_optimizer.step()
 
                 # Actor update
-                new_actions, log_probs, entropy, mean_actions = self.policy.sample_actions(batch_obs)
-                qf, _, _, _ = self.critic(batch_critic_obs, new_actions)
+                (
+                    new_actions,
+                    log_probs,
+                    entropy,
+                    _,
+                    temperature,
+                    beta,
+                ) = self.policy.sample_actions_from_normalized(batch_obs)
+                qf, _, _, _ = self.critic.forward_normalized(batch_critic_obs, new_actions)
 
                 with torch.inference_mode():
-                    old_actor_obs = old_policy.actor_obs_normalizer(old_policy.get_actor_obs(batch_obs))
-                    old_mean = old_policy.actor_mean(old_actor_obs)
-                    old_std = old_policy._get_std(old_mean)
-                    new_actor_obs = self.policy.actor_obs_normalizer(self.policy.get_actor_obs(batch_obs))
-                    new_mean = self.policy.actor_mean(new_actor_obs)
-                    new_std = self.policy._get_std(new_mean)
-                    kl = torch.distributions.kl_divergence(
-                        torch.distributions.Normal(old_mean, old_std),
-                        torch.distributions.Normal(new_mean, new_std),
-                    ).sum(dim=-1)
+                    old_dist = old_policy.build_distribution_from_normalized(batch_obs)
+                    new_dist = self.policy.build_distribution_from_normalized(batch_obs)
+                    old_actions = old_dist.sample((16,)).clamp(-1 + 1e-6, 1 - 1e-6)
+                    old_log_probs = old_dist.log_prob(old_actions).sum(dim=-1).mean(dim=0)
+                    new_log_probs = new_dist.log_prob(old_actions).sum(dim=-1).mean(dim=0)
+                    kl = old_log_probs - new_log_probs
 
-                temperature = torch.exp(self.policy.log_temp)
-                beta = torch.exp(self.policy.log_lagrange)
                 actor_loss = -qf + temperature.detach() * log_probs
 
                 if self.actor_kl_clip_mode == "clipped":
@@ -321,7 +337,7 @@ class ReppoRunner:
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 actor_loss.backward()
                 if self.is_distributed:
-                    self.reduce_parameters()
+                    self.reduce_parameters(self.policy.parameters())
                 torch.nn.utils.clip_grad_norm_(
                     self.policy.parameters(), self.cfg["algorithm"].get("max_grad_norm", 1.0)
                 )
@@ -417,8 +433,8 @@ class ReppoRunner:
         self.policy.load_state_dict(model_params[0])
         self.critic.load_state_dict(model_params[1])
 
-    def reduce_parameters(self) -> None:
-        all_params: Iterable[torch.nn.Parameter] = list(self.policy.parameters()) + list(self.critic.parameters())
+    def reduce_parameters(self, params: Iterable[torch.nn.Parameter] | None = None) -> None:
+        all_params = list(params) if params is not None else list(self.policy.parameters()) + list(self.critic.parameters())
         grads = [param.grad.view(-1) for param in all_params if param.grad is not None]
         if not grads:
             return
@@ -438,10 +454,32 @@ class ReppoRunner:
         if not self.is_distributed:
             self.gpu_local_rank = 0
             self.gpu_global_rank = 0
+            self.cfg["multi_gpu"] = None
             return
 
         self.gpu_local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.gpu_global_rank = int(os.getenv("RANK", "0"))
+        self.cfg["multi_gpu"] = {
+            "global_rank": self.gpu_global_rank,
+            "local_rank": self.gpu_local_rank,
+            "world_size": self.gpu_world_size,
+        }
+
+        if self.device != f"cuda:{self.gpu_local_rank}":
+            raise ValueError(
+                f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'."
+            )
+        if self.gpu_local_rank >= self.gpu_world_size:
+            raise ValueError(
+                f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
+            )
+        if self.gpu_global_rank >= self.gpu_world_size:
+            raise ValueError(
+                f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
+            )
+
+        torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
+        torch.cuda.set_device(self.gpu_local_rank)
 
     def _stack_transitions(self, transitions: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         keys = transitions[0].keys()
