@@ -50,6 +50,8 @@ class ReppoRunner:
         self.vmin = algorithm_cfg.get("vmin", 0.0)
         self.vmax = algorithm_cfg.get("vmax", 150.0)
         self.aux_loss_mult = algorithm_cfg.get("aux_loss_mult", 0.0)
+        self.num_action_samples = algorithm_cfg.get("num_action_samples", 64)
+        self.num_action_sample_chunk_size = algorithm_cfg.get("num_action_sample_chunk_size", 8)
         self.kl_bound = algorithm_cfg.get("kl_bound", algorithm_cfg.get("desired_kl", 0.1))
         self.actor_kl_clip_mode = algorithm_cfg.get("actor_kl_clip_mode", "clipped")
         self.ent_target_mult = algorithm_cfg.get("ent_target_mult", 0.5)
@@ -153,15 +155,13 @@ class ReppoRunner:
         self.logger.stop_logging_writer()
 
     def act(self, obs: TensorDict) -> torch.Tensor:
-        self.policy.update_normalization(obs)
-        self.critic.update_normalization(obs)
-
-        actor_obs = self.policy.normalize_actor_obs(obs)
-        critic_obs = self.critic.normalize_critic_obs(obs)
+        raw_actor_obs = self.policy.get_actor_obs(obs)
+        raw_critic_obs = self.critic.get_critic_obs(obs)
+        actor_obs = self.policy.normalize_actor_obs(raw_actor_obs)
         actions, log_prob, entropy, _, _, _ = self.policy.sample_actions_from_normalized(actor_obs)
         self.pending_transition = {
-            "observations": actor_obs.detach(),
-            "critic_observations": critic_obs.detach(),
+            "observations": raw_actor_obs.detach(),
+            "critic_observations": raw_critic_obs.detach(),
             "actions": actions.detach(),
             "log_probs": log_prob.detach(),
             "entropy": entropy.detach(),
@@ -184,16 +184,8 @@ class ReppoRunner:
             if isinstance(maybe_final_obs, TensorDict):
                 effective_next_obs = maybe_final_obs
 
-        with torch.inference_mode():
-            self.policy.update_normalization(effective_next_obs)
-            self.critic.update_normalization(effective_next_obs)
-            next_actor_obs = self.policy.normalize_actor_obs(effective_next_obs)
-            next_critic_obs = self.critic.normalize_critic_obs(effective_next_obs)
-            next_actions, next_log_probs, _, _, temperature, _ = self.policy.sample_actions_from_normalized(
-                next_actor_obs
-            )
-            next_value, _, next_pred, next_embedding = self.critic.forward_normalized(next_critic_obs, next_actions)
-            rewards = rewards - self.gamma * next_log_probs * temperature
+        next_actor_obs = self.policy.get_actor_obs(effective_next_obs)
+        next_critic_obs = self.critic.get_critic_obs(effective_next_obs)
 
         truncations = extras.get("time_outs")
         if truncations is None:
@@ -209,9 +201,8 @@ class ReppoRunner:
                 "rewards": rewards.clone().to(dtype=torch.float32),
                 "dones": dones.to(dtype=torch.float32),
                 "truncations": truncations.to(dtype=torch.float32),
-                "next_values": next_value.unsqueeze(-1),
-                "next_embeddings": next_embedding,
-                "next_predictions": next_pred,
+                "next_observations": next_actor_obs.detach(),
+                "next_critic_observations": next_critic_obs.detach(),
             }
         )
         self.transitions.append(transition)
@@ -223,6 +214,9 @@ class ReppoRunner:
             return
 
         data = self._stack_transitions(self.transitions)
+        data = self._normalize_rollout(data)
+        rollout_extras = self._compute_rollout_extras(data)
+        data.update(rollout_extras)
         data["gve"] = self._compute_gve(
             rewards=data["rewards"],
             dones=data["dones"],
@@ -246,7 +240,6 @@ class ReppoRunner:
         next_embeddings = data["next_embeddings"].flatten(0, 1)
         gve = data["gve"].flatten(0, 1)
 
-        total_batches = self.num_learning_epochs * self.num_mini_batches
         batch_size = max(1, obs.shape[0] // self.num_mini_batches)
         indices = torch.arange(obs.shape[0], device=self.device)
 
@@ -258,6 +251,7 @@ class ReppoRunner:
         mean_entropy = 0.0
         mean_kl = 0.0
         mean_embedding_loss = 0.0
+        num_updates = 0
 
         old_policy = self.policy_old
 
@@ -348,8 +342,11 @@ class ReppoRunner:
                 mean_entropy += entropy.mean().item()
                 mean_kl += kl.mean().item()
                 mean_embedding_loss += embedding_loss.item()
+                num_updates += 1
 
-        num_updates = total_batches
+        if num_updates == 0:
+            raise RuntimeError("REPPO update produced zero optimization batches")
+
         mean_critic_loss /= num_updates
         mean_actor_loss /= num_updates
         mean_entropy /= num_updates
@@ -432,6 +429,7 @@ class ReppoRunner:
         torch.distributed.broadcast_object_list(model_params, src=0)
         self.policy.load_state_dict(model_params[0])
         self.critic.load_state_dict(model_params[1])
+        self.policy_old.load_state_dict(model_params[0])
 
     def reduce_parameters(self, params: Iterable[torch.nn.Parameter] | None = None) -> None:
         all_params = list(params) if params is not None else list(self.policy.parameters()) + list(self.critic.parameters())
@@ -507,3 +505,67 @@ class ReppoRunner:
             last_gve = rewards[t] + delta
             gves.insert(0, last_gve)
         return torch.stack(gves)
+
+    def _compute_rollout_extras(self, data: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        next_obs = data["next_observations"]
+        next_critic_obs = data["next_critic_observations"]
+        rewards = data["rewards"]
+        actions = data["actions"]
+        truncations = data["truncations"]
+
+        with torch.inference_mode():
+            next_dist = self.policy.build_distribution_from_normalized(next_obs)
+            sampled_next_actions = next_dist.sample()
+            shifted_actions = torch.cat([actions[1:], sampled_next_actions[-1:]], dim=0)
+            true_next_actions = torch.where(
+                truncations.bool().expand_as(sampled_next_actions),
+                sampled_next_actions,
+                shifted_actions,
+            ).clamp(-1 + 1e-6, 1 - 1e-6)
+            next_log_probs = next_dist.log_prob(true_next_actions).sum(dim=-1, keepdim=True)
+            temperature = torch.exp(self.policy.log_temp)
+            soft_rewards = rewards - self.gamma * next_log_probs * temperature
+
+            value_sum = None
+            next_embeddings = None
+            remaining_samples = self.num_action_samples
+            while remaining_samples > 0:
+                chunk_size = min(self.num_action_sample_chunk_size, remaining_samples)
+                sampled_value_actions = next_dist.sample(sample_shape=(chunk_size,))
+                expanded_next_critic_obs = next_critic_obs.unsqueeze(0).expand(chunk_size, *next_critic_obs.shape)
+                next_values, _, _, chunk_embeddings = self.critic.forward_normalized(
+                    expanded_next_critic_obs, sampled_value_actions
+                )
+                chunk_value_sum = next_values.sum(dim=0)
+                value_sum = chunk_value_sum if value_sum is None else value_sum + chunk_value_sum
+                if next_embeddings is None:
+                    next_embeddings = chunk_embeddings[0]
+                remaining_samples -= chunk_size
+
+        if value_sum is None or next_embeddings is None:
+            raise RuntimeError("REPPO next-value estimation produced no samples")
+
+        return {
+            "rewards": soft_rewards.to(dtype=torch.float32),
+            "next_values": (value_sum / float(self.num_action_samples)).unsqueeze(-1).to(dtype=torch.float32),
+            "next_embeddings": next_embeddings.to(dtype=torch.float32),
+        }
+
+    def _normalize_rollout(self, data: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        observations = data["observations"]
+        critic_observations = data["critic_observations"]
+        next_observations = data["next_observations"]
+        next_critic_observations = data["next_critic_observations"]
+
+        normalized_data = dict(data)
+        normalized_data["observations"] = self.policy.normalize_actor_obs(observations).detach()
+        normalized_data["critic_observations"] = self.critic.normalize_critic_obs(critic_observations).detach()
+        normalized_data["next_observations"] = self.policy.normalize_actor_obs(next_observations).detach()
+        normalized_data["next_critic_observations"] = self.critic.normalize_critic_obs(next_critic_observations).detach()
+
+        if self.policy.actor_obs_normalization:
+            self.policy.actor_obs_normalizer.update(observations.flatten(0, -2))  # type: ignore[operator]
+        if self.critic.critic_obs_normalization:
+            self.critic.critic_obs_normalizer.update(critic_observations.flatten(0, -2))  # type: ignore[operator]
+
+        return normalized_data

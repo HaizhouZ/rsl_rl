@@ -130,7 +130,7 @@ class _FCNN(nn.Module):
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, hidden_dim))
             if use_norm:
-                layers.append(nn.RMSNorm(hidden_dim))
+                layers.append(_ExportableRMSNorm(hidden_dim))
             layers.append(_activation(activation))
             prev_dim = hidden_dim
         layers.append(nn.Linear(prev_dim, output_dim))
@@ -138,6 +138,17 @@ class _FCNN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+class _ExportableRMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
+        return x * rms * self.weight
 
 
 def _concat_obs(obs: TensorDict, obs_groups: list[str]) -> torch.Tensor:
@@ -262,7 +273,7 @@ class ReppoPolicy(nn.Module):
         out = self.actor_model(normalized_obs)
         mean, log_std = torch.split(out, out.shape[-1] // 2, dim=-1)
         std = torch.exp(log_std) + self.actor_min_std
-        self._cached_output_std.copy_(std.mean(dim=0).detach())
+        self._cached_output_std.copy_(std.reshape(-1, std.shape[-1]).mean(dim=0).detach())
         dist = TransformedDistribution(Normal(mean, std), [TanhTransform(cache_size=1)])
         return dist, torch.tanh(mean), torch.exp(self.log_temp), torch.exp(self.log_lagrange)
 
