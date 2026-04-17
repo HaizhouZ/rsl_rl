@@ -51,7 +51,7 @@ class ReppoRunner:
         self.vmax = algorithm_cfg.get("vmax", 150.0)
         self.aux_loss_mult = algorithm_cfg.get("aux_loss_mult", 0.0)
         self.num_action_samples = algorithm_cfg.get("num_action_samples", 64)
-        self.num_action_sample_chunk_size = algorithm_cfg.get("num_action_sample_chunk_size", 8)
+        self.num_action_sample_chunk_size = algorithm_cfg.get("num_action_sample_chunk_size", 1)
         self.kl_bound = algorithm_cfg.get("kl_bound", algorithm_cfg.get("desired_kl", 0.1))
         self.actor_kl_clip_mode = algorithm_cfg.get("actor_kl_clip_mode", "clipped")
         self.ent_target_mult = algorithm_cfg.get("ent_target_mult", 0.5)

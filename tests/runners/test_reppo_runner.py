@@ -87,12 +87,16 @@ def test_compute_returns_uses_final_observation_and_monte_carlo_next_values() ->
     class FakeDist:
         def __init__(self, obs: torch.Tensor) -> None:
             self.obs = obs
+            self._sample_cursor = 0
 
         def sample(self, sample_shape: tuple[int, ...] = torch.Size()) -> torch.Tensor:
             seen_next_obs.append(self.obs.clone())
             if sample_shape:
-                samples = torch.tensor([[[[0.1, 0.1]]], [[[0.2, 0.2]]], [[[0.3, 0.3]]]], dtype=torch.float32)
-                return samples
+                chunk_size = sample_shape[0]
+                base = torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32)
+                values = base[self._sample_cursor : self._sample_cursor + chunk_size]
+                self._sample_cursor += chunk_size
+                return values.view(chunk_size, 1, 1, 1).expand(chunk_size, 1, 1, 2)
             return torch.tensor([[[0.4, 0.4]]], dtype=torch.float32)
 
         def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
@@ -103,8 +107,7 @@ def test_compute_returns_uses_final_observation_and_monte_carlo_next_values() ->
 
     def fake_forward_normalized(self, obs: torch.Tensor, action: torch.Tensor):
         if obs.dim() == 4:
-            values = torch.tensor([[[1.0]], [[2.0]], [[3.0]]], dtype=torch.float32)
-            values = values.expand(obs.shape[0], obs.shape[1], obs.shape[2])
+            values = action[..., :1] * 10.0
             embeddings = torch.ones(obs.shape[0], obs.shape[1], obs.shape[2], 8, dtype=torch.float32) * 9.0
             return values, torch.zeros(*values.shape, self.num_atoms), torch.ones_like(embeddings), embeddings
         return (
