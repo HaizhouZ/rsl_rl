@@ -300,3 +300,63 @@ def test_broadcast_parameters_syncs_policy_old() -> None:
     policy_state = runner.policy.state_dict()
     for key, value in policy_state.items():
         assert torch.allclose(policy_old_state[key], value)
+
+
+def test_reppo_runner_rejects_unsupported_policy_keys() -> None:
+    env = DummyEnv()
+    cfg = {
+        "num_steps_per_env": 1,
+        "save_interval": 100,
+        "obs_groups": {"actor": ["policy"], "critic": ["critic"]},
+        "policy": {
+            "class_name": "ReppoPolicy",
+            "critic_class_name": "ReppoCritic",
+            "actor_hidden_dims": [8],
+            "critic_hidden_dims": [8],
+            "actor_obs_normalization": False,
+            "critic_obs_normalization": False,
+            "bogus_key": 123,
+        },
+        "algorithm": {
+            "learning_rate": 3e-4,
+            "gamma": 0.99,
+            "num_mini_batches": 1,
+            "num_learning_epochs": 1,
+        },
+    }
+
+    with mock.patch("rsl_rl.runners.reppo_runner.Logger"):
+        try:
+            ReppoRunner(env, cfg, log_dir=None, device="cpu")
+        except ValueError as exc:
+            assert "bogus_key" in str(exc)
+        else:
+            raise AssertionError("Expected unsupported REPPO config keys to raise ValueError")
+
+
+def test_reppo_normalization_updates_include_next_observations() -> None:
+    runner = _make_runner(num_steps_per_env=1)
+    runner.policy.actor_obs_normalization = True
+    runner.critic.critic_obs_normalization = True
+
+    actor_updates: list[torch.Tensor] = []
+    critic_updates: list[torch.Tensor] = []
+    runner.policy.actor_obs_normalizer.update = lambda x: actor_updates.append(x.clone())  # type: ignore[method-assign]
+    runner.critic.critic_obs_normalizer.update = lambda x: critic_updates.append(x.clone())  # type: ignore[method-assign]
+
+    obs = runner.env.get_observations()
+    runner.act(obs)
+    next_obs = TensorDict(
+        {
+            "policy": torch.tensor([[5.0, 6.0]], dtype=torch.float32),
+            "critic": torch.tensor([[7.0, 8.0]], dtype=torch.float32),
+        },
+        batch_size=[1],
+    )
+    runner.process_env_step(next_obs, rewards=torch.tensor([1.0]), dones=torch.tensor([0.0]), extras={})
+    runner.compute_returns(next_obs)
+
+    assert len(actor_updates) == 1
+    assert len(critic_updates) == 1
+    assert torch.allclose(actor_updates[0], torch.tensor([[1.0, 2.0], [5.0, 6.0]]))
+    assert torch.allclose(critic_updates[0], torch.tensor([[3.0, 4.0], [7.0, 8.0]]))

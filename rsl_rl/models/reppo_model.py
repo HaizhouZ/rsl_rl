@@ -112,6 +112,16 @@ def _activation(name: str | None) -> nn.Module:
     raise ValueError(f"Unsupported REPPO activation: {name}")
 
 
+def _resolve_initial_std(init_noise_std: float, noise_std_type: str) -> float:
+    if noise_std_type == "scalar":
+        return float(init_noise_std)
+    if noise_std_type == "log":
+        return float(torch.exp(torch.tensor(init_noise_std)).item())
+    raise ValueError(
+        f"Unsupported REPPO noise_std_type: {noise_std_type}. Expected 'scalar' or 'log'."
+    )
+
+
 class _FCNN(nn.Module):
     def __init__(
         self,
@@ -227,17 +237,35 @@ class ReppoPolicy(nn.Module):
             use_output_norm=False,
             output_activation=None,
         )
+        initial_std = _resolve_initial_std(init_noise_std, noise_std_type)
+        self._initialize_actor_std_head(num_actions, initial_std, actor_min_std)
         self.actor_mean = _ActorMeanHead(self.actor_model, num_actions)
         self.actor = _DeterministicActor(self.actor_mean)
 
         self.actor_min_std = actor_min_std
-        self.init_noise_std = init_noise_std
-        self.register_buffer("_cached_output_std", init_noise_std * torch.ones(num_actions))
+        self.init_noise_std = initial_std
+        self.noise_std_type = noise_std_type
+        self.register_buffer("_cached_output_std", initial_std * torch.ones(num_actions))
 
         self.log_temp = nn.Parameter(torch.log(torch.tensor(ent_start)))
         self.log_lagrange = nn.Parameter(torch.log(torch.tensor(kl_start)))
 
         Normal.set_default_validate_args(False)
+
+    def _initialize_actor_std_head(self, num_actions: int, init_noise_std: float, actor_min_std: float) -> None:
+        last_linear = None
+        for module in reversed(self.actor_model.net):  # type: ignore[attr-defined]
+            if isinstance(module, nn.Linear):
+                last_linear = module
+                break
+        if last_linear is None:
+            raise RuntimeError("REPPO actor model does not contain a terminal linear layer.")
+
+        target_std = max(init_noise_std - actor_min_std, 1e-6)
+        target_log_std = torch.log(torch.tensor(target_std, dtype=last_linear.weight.dtype))
+        with torch.no_grad():
+            last_linear.weight[num_actions:].zero_()
+            last_linear.bias[num_actions:].fill_(target_log_std.item())
 
     def _get_obs_dim(self, obs: TensorDict, obs_groups: list[str]) -> int:
         obs_dim = 0

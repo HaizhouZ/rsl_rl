@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import os
 import time
 from collections.abc import Iterable
@@ -57,13 +58,14 @@ class ReppoRunner:
         self.ent_target_mult = algorithm_cfg.get("ent_target_mult", 0.5)
         policy_class = resolve_callable(policy_cfg.pop("class_name", "ReppoPolicy"))  # type: ignore
         critic_class = resolve_callable(policy_cfg.pop("critic_class_name", "ReppoCritic"))  # type: ignore
+        actor_cfg, critic_cfg = self._split_policy_kwargs(policy_class, critic_class, policy_cfg)
 
-        self.policy = policy_class(obs, self.cfg["obs_groups"], self.env.num_actions, **policy_cfg).to(self.device)
+        self.policy = policy_class(obs, self.cfg["obs_groups"], self.env.num_actions, **actor_cfg).to(self.device)
         self.critic = critic_class(
             obs,
             self.cfg["obs_groups"],
             self.env.num_actions,
-            **policy_cfg,
+            **critic_cfg,
             num_atoms=self.num_atoms,
             vmin=self.vmin,
             vmax=self.vmax,
@@ -93,6 +95,7 @@ class ReppoRunner:
         self.pending_transition: dict[str, torch.Tensor] | None = None
         self.transitions: list[dict[str, torch.Tensor]] = []
         self.rollout_data: dict[str, torch.Tensor] | None = None
+        self.rollout_metrics: dict[str, float] = {}
         self.alg = SimpleNamespace(policy=self.policy, critic=self.critic)
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
@@ -129,7 +132,7 @@ class ReppoRunner:
             start = stop
 
             self.compute_returns(obs)
-            loss_dict = self.update()
+            loss_dict, metric_dict = self.update()
 
             stop = time.time()
             learn_time = stop - start
@@ -142,6 +145,7 @@ class ReppoRunner:
                 collect_time=collect_time,
                 learn_time=learn_time,
                 loss_dict=loss_dict,
+                metric_dict=metric_dict,
                 learning_rate=self.actor_optimizer.param_groups[0]["lr"],
                 action_std=self.policy.output_std,
                 rnd_weight=None,
@@ -217,6 +221,14 @@ class ReppoRunner:
         data = self._normalize_rollout(data)
         rollout_extras = self._compute_rollout_extras(data)
         data.update(rollout_extras)
+        self.logger.process_algo_rewards("soft_reward", data["rewards"], data["dones"])
+        self.rollout_metrics = {
+            "raw_reward_step": data["raw_rewards"].mean().item(),
+            "soft_reward_step": data["rewards"].mean().item(),
+            "soft_bonus_step": data["soft_bonus"].mean().item(),
+            "mean_next_log_prob": data["next_log_probs"].mean().item(),
+            "temperature": data["temperature"].mean().item(),
+        }
         data["gve"] = self._compute_gve(
             rewards=data["rewards"],
             dones=data["dones"],
@@ -225,9 +237,9 @@ class ReppoRunner:
         )
         self.rollout_data = data
 
-    def update(self) -> dict[str, float]:
+    def update(self) -> tuple[dict[str, float], dict[str, float]]:
         if self.rollout_data is None:
-            return {}
+            return {}, {}
 
         data = self.rollout_data
         obs = data["observations"].flatten(0, 1)
@@ -251,6 +263,8 @@ class ReppoRunner:
         mean_entropy = 0.0
         mean_kl = 0.0
         mean_embedding_loss = 0.0
+        mean_temperature = 0.0
+        mean_beta = 0.0
         num_updates = 0
 
         old_policy = self.policy_old
@@ -342,6 +356,8 @@ class ReppoRunner:
                 mean_entropy += entropy.mean().item()
                 mean_kl += kl.mean().item()
                 mean_embedding_loss += embedding_loss.item()
+                mean_temperature += temperature.mean().item()
+                mean_beta += beta.mean().item()
                 num_updates += 1
 
         if num_updates == 0:
@@ -352,18 +368,25 @@ class ReppoRunner:
         mean_entropy /= num_updates
         mean_kl /= num_updates
         mean_embedding_loss /= num_updates
+        mean_temperature /= num_updates
+        mean_beta /= num_updates
 
         self.transitions.clear()
         self.rollout_data = None
         self.policy_old.load_state_dict(self.policy.state_dict())
 
-        return {
+        loss_dict = {
             "critic": mean_critic_loss,
             "actor": mean_actor_loss,
             "entropy": mean_entropy,
             "kl": mean_kl,
             "embedding": mean_embedding_loss,
         }
+        metric_dict = dict(self.rollout_metrics)
+        metric_dict["temperature"] = mean_temperature
+        metric_dict["beta"] = mean_beta
+        self.rollout_metrics = {}
+        return loss_dict, metric_dict
 
     def train_mode(self) -> None:
         self.policy.train()
@@ -524,7 +547,8 @@ class ReppoRunner:
             ).clamp(-1 + 1e-6, 1 - 1e-6)
             next_log_probs = next_dist.log_prob(true_next_actions).sum(dim=-1, keepdim=True)
             temperature = torch.exp(self.policy.log_temp)
-            soft_rewards = rewards - self.gamma * next_log_probs * temperature
+            soft_bonus = -self.gamma * next_log_probs * temperature
+            soft_rewards = rewards + soft_bonus
 
             value_sum = None
             next_embeddings = None
@@ -546,7 +570,11 @@ class ReppoRunner:
             raise RuntimeError("REPPO next-value estimation produced no samples")
 
         return {
+            "raw_rewards": rewards.to(dtype=torch.float32),
             "rewards": soft_rewards.to(dtype=torch.float32),
+            "soft_bonus": soft_bonus.to(dtype=torch.float32),
+            "next_log_probs": next_log_probs.to(dtype=torch.float32),
+            "temperature": torch.full_like(rewards, float(temperature.item()), dtype=torch.float32),
             "next_values": (value_sum / float(self.num_action_samples)).unsqueeze(-1).to(dtype=torch.float32),
             "next_embeddings": next_embeddings.to(dtype=torch.float32),
         }
@@ -564,8 +592,30 @@ class ReppoRunner:
         normalized_data["next_critic_observations"] = self.critic.normalize_critic_obs(next_critic_observations).detach()
 
         if self.policy.actor_obs_normalization:
-            self.policy.actor_obs_normalizer.update(observations.flatten(0, -2))  # type: ignore[operator]
+            actor_obs_update = torch.cat([observations, next_observations], dim=0)
+            self.policy.actor_obs_normalizer.update(actor_obs_update.flatten(0, -2))  # type: ignore[operator]
         if self.critic.critic_obs_normalization:
-            self.critic.critic_obs_normalizer.update(critic_observations.flatten(0, -2))  # type: ignore[operator]
+            critic_obs_update = torch.cat([critic_observations, next_critic_observations], dim=0)
+            self.critic.critic_obs_normalizer.update(critic_obs_update.flatten(0, -2))  # type: ignore[operator]
 
         return normalized_data
+
+    @staticmethod
+    def _constructor_kwargs(constructor: type) -> set[str]:
+        parameters = inspect.signature(constructor.__init__).parameters
+        ignored = {"self", "obs", "obs_groups", "num_actions", "kwargs"}
+        return {name for name, param in parameters.items() if name not in ignored and param.kind != inspect.Parameter.VAR_KEYWORD}
+
+    def _split_policy_kwargs(self, policy_class: type, critic_class: type, shared_cfg: dict) -> tuple[dict, dict]:
+        actor_allowed = self._constructor_kwargs(policy_class)
+        critic_allowed = self._constructor_kwargs(critic_class)
+
+        actor_cfg = {key: value for key, value in shared_cfg.items() if key in actor_allowed}
+        critic_cfg = {key: value for key, value in shared_cfg.items() if key in critic_allowed}
+
+        unsupported = set(shared_cfg) - actor_allowed - critic_allowed
+        if unsupported:
+            unsupported_list = ", ".join(sorted(unsupported))
+            raise ValueError(f"Unsupported REPPO policy config keys: {unsupported_list}")
+
+        return actor_cfg, critic_cfg

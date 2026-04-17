@@ -41,6 +41,7 @@ class Logger:
         self.git_status_repos = [rsl_rl.__file__]
         self.tot_timesteps = 0
         self.tot_time = 0
+        self.writer = None
 
         # Create buffers
         self.ep_extras = []
@@ -48,6 +49,8 @@ class Logger:
         self.lenbuffer = deque(maxlen=100)
         self.cur_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.cur_episode_length = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.extra_rewbuffers: dict[str, deque[float]] = {}
+        self.cur_extra_reward_sums: dict[str, torch.Tensor] = {}
 
         # Create RND buffers
         if self.cfg["algorithm"].get("rnd_cfg"):
@@ -129,6 +132,35 @@ class Logger:
                 self.cur_ereward_sum[new_ids] = 0
                 self.cur_ireward_sum[new_ids] = 0
 
+    def process_algo_rewards(self, reward_name: str, rewards: torch.Tensor, dones: torch.Tensor) -> None:
+        """Accumulate an additional episode reward stream, such as REPPO soft rewards."""
+        if self.writer is None:
+            return
+
+        if reward_name not in self.extra_rewbuffers:
+            self.extra_rewbuffers[reward_name] = deque(maxlen=100)
+            self.cur_extra_reward_sums[reward_name] = torch.zeros(
+                self.num_envs, dtype=torch.float, device=self.device
+            )
+
+        reward_tensor = rewards
+        done_tensor = dones
+        if reward_tensor.dim() == 2:
+            reward_tensor = reward_tensor.unsqueeze(0)
+            done_tensor = done_tensor.unsqueeze(0)
+        elif reward_tensor.dim() != 3:
+            raise ValueError(
+                f"Expected reward tensor with shape [T, N, 1] or [N, 1], got {tuple(reward_tensor.shape)}."
+            )
+
+        running_sum = self.cur_extra_reward_sums[reward_name]
+        rewbuffer = self.extra_rewbuffers[reward_name]
+        for step_rewards, step_dones in zip(reward_tensor, done_tensor, strict=True):
+            running_sum += step_rewards[:, 0]
+            new_ids = (step_dones > 0).nonzero(as_tuple=False)
+            rewbuffer.extend(running_sum[new_ids][:, 0].cpu().numpy().tolist())
+            running_sum[new_ids] = 0
+
     def log(
         self,
         it: int,
@@ -140,6 +172,7 @@ class Logger:
         learning_rate: float,
         action_std: torch.Tensor,
         rnd_weight: float | None,
+        metric_dict: dict | None = None,
         print_minimal: bool = False,
         width: int = 80,
         pad: int = 40,
@@ -149,6 +182,7 @@ class Logger:
         If videos are available, they are uploaded to the logging service (W&B) as well.
         """
         if self.writer is not None:
+            has_rnd = bool(self.cfg["algorithm"].get("rnd_cfg"))
             collection_size = self.cfg["num_steps_per_env"] * self.num_envs * self.gpu_world_size
             iteration_time = collect_time + learn_time
             self.tot_timesteps += collection_size
@@ -181,6 +215,9 @@ class Logger:
             # Log losses
             for key, value in loss_dict.items():
                 self.writer.add_scalar(f"Loss/{key}", value, it)
+            if metric_dict:
+                for key, value in metric_dict.items():
+                    self.writer.add_scalar(f"Metrics/{key}", value, it)
             self.writer.add_scalar("Loss/learning_rate", learning_rate, it)
 
             # Log std
@@ -194,11 +231,14 @@ class Logger:
 
             # Log rewards and episode length
             if len(self.rewbuffer) > 0:
-                if self.cfg["algorithm"]["rnd_cfg"]:
+                if has_rnd:
                     self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(self.erewbuffer), it)
                     self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(self.irewbuffer), it)
                     self.writer.add_scalar("Rnd/weight", rnd_weight, it)  # type: ignore
                 self.writer.add_scalar("Train/mean_reward", statistics.mean(self.rewbuffer), it)
+                for reward_name, reward_buffer in self.extra_rewbuffers.items():
+                    if reward_buffer:
+                        self.writer.add_scalar(f"Train/mean_{reward_name}", statistics.mean(reward_buffer), it)
                 self.writer.add_scalar("Train/mean_episode_length", statistics.mean(self.lenbuffer), it)
                 if self.logger_type != "wandb":
                     self.writer.add_scalar(
@@ -227,13 +267,21 @@ class Logger:
             # Print losses
             for key, value in loss_dict.items():
                 log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
+            if metric_dict:
+                for key, value in metric_dict.items():
+                    pretty_key = key.replace("_", " ")
+                    log_string += f"""{f"Mean {pretty_key}:":>{pad}} {value:.4f}\n"""
 
             # Print rewards and episode length
             if len(self.rewbuffer) > 0:
-                if self.cfg["algorithm"]["rnd_cfg"]:
+                if has_rnd:
                     log_string += f"""{"Mean extrinsic reward:":>{pad}} {statistics.mean(self.erewbuffer):.2f}\n"""
                     log_string += f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(self.irewbuffer):.2f}\n"""
                 log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
+                for reward_name, reward_buffer in self.extra_rewbuffers.items():
+                    if reward_buffer:
+                        pretty_name = reward_name.replace("_", " ")
+                        log_string += f"""{f"Mean {pretty_name}:":>{pad}} {statistics.mean(reward_buffer):.2f}\n"""
                 log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
 
             # Print std

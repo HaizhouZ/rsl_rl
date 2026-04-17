@@ -84,6 +84,23 @@ def test_reppo_policy_layer_count_matches_total_layers_semantics() -> None:
     assert len(linear_layers) == 3
 
 
+def test_reppo_policy_log_noise_std_type_initializes_exp_scale() -> None:
+    obs = _make_obs()
+    policy = ReppoPolicy(
+        obs,
+        {"actor": ["policy"], "critic": ["critic"]},
+        num_actions=2,
+        actor_obs_normalization=False,
+        actor_hidden_dims=(4,),
+        init_noise_std=0.0,
+        noise_std_type="log",
+        actor_min_std=0.1,
+        use_actor_norm=False,
+    )
+
+    assert torch.allclose(policy.output_std, torch.ones(2), atol=1e-6)
+
+
 def test_reppo_critic_uses_encoder_output_norm_when_enabled() -> None:
     obs = _make_obs()
     critic = ReppoCritic(
