@@ -8,7 +8,8 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
-from rsl_rl.models import ReppoPolicy
+from rsl_rl.models import ReppoCritic, ReppoPolicy
+from rsl_rl.models.reppo_model import _ExportableRMSNorm
 
 
 def _make_obs() -> TensorDict:
@@ -64,3 +65,37 @@ def test_reppo_policy_uses_state_dependent_std() -> None:
 
     assert std.shape == (2, 2)
     assert not torch.allclose(std[0], std[1]), "REPPO actor std should depend on the observation"
+
+
+def test_reppo_policy_layer_count_matches_total_layers_semantics() -> None:
+    obs = _make_obs()
+    policy = ReppoPolicy(
+        obs,
+        {"actor": ["policy"], "critic": ["critic"]},
+        num_actions=2,
+        actor_obs_normalization=False,
+        actor_hidden_dims=(),
+        actor_hidden_dim=4,
+        num_actor_layers=3,
+        use_actor_norm=False,
+    )
+
+    linear_layers = [module for module in policy.actor_model.modules() if isinstance(module, torch.nn.Linear)]
+    assert len(linear_layers) == 3
+
+
+def test_reppo_critic_uses_encoder_output_norm_when_enabled() -> None:
+    obs = _make_obs()
+    critic = ReppoCritic(
+        obs,
+        {"critic": ["critic"]},
+        num_actions=2,
+        critic_obs_normalization=False,
+        critic_hidden_dims=(),
+        critic_hidden_dim=4,
+        num_critic_encoder_layers=2,
+        use_critic_norm=True,
+        use_encoder_norm=True,
+    )
+
+    assert isinstance(critic.feature_module.net[-1], _ExportableRMSNorm)

@@ -93,11 +93,11 @@ class _ActorMeanHead(nn.Module):
 def _resolve_hidden_dims(
     explicit_dims: tuple[int, ...] | list[int] | None,
     fallback_hidden_dim: int,
-    fallback_layers: int,
+    total_layers: int,
 ) -> tuple[int, ...]:
     if explicit_dims is not None and len(explicit_dims) > 0:
         return tuple(explicit_dims)
-    return tuple([fallback_hidden_dim] * fallback_layers)
+    return tuple([fallback_hidden_dim] * max(0, total_layers - 1))
 
 
 def _activation(name: str | None) -> nn.Module:
@@ -120,7 +120,9 @@ class _FCNN(nn.Module):
         hidden_dims: tuple[int, ...] | list[int],
         activation: str = "swish",
         use_norm: bool = True,
+        use_output_norm: bool = False,
         input_activation: bool = False,
+        output_activation: str | None = None,
     ) -> None:
         super().__init__()
         layers: list[nn.Module] = []
@@ -134,6 +136,10 @@ class _FCNN(nn.Module):
             layers.append(_activation(activation))
             prev_dim = hidden_dim
         layers.append(nn.Linear(prev_dim, output_dim))
+        if use_output_norm:
+            layers.append(_ExportableRMSNorm(output_dim))
+        if output_activation is not None:
+            layers.append(_activation(output_activation))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -174,7 +180,7 @@ class ReppoPolicy(nn.Module):
         critic_obs_normalization: bool = False,
         actor_hidden_dims: tuple[int, ...] | list[int] = (512, 512, 512),
         critic_hidden_dims: tuple[int, ...] | list[int] = (512, 512, 512),
-        activation: str = "elu",
+        activation: str = "swish",
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         actor_min_std: float = 0.0,
@@ -218,6 +224,8 @@ class ReppoPolicy(nn.Module):
             actor_hidden_dims,
             activation=activation if activation is not None else "swish",
             use_norm=use_actor_norm,
+            use_output_norm=False,
+            output_activation=None,
         )
         self.actor_mean = _ActorMeanHead(self.actor_model, num_actions)
         self.actor = _DeterministicActor(self.actor_mean)
@@ -336,7 +344,7 @@ class ReppoCritic(nn.Module):
         actor_hidden_dims: tuple[int, ...] | list[int] = (512, 512, 512),
         critic_hidden_dims: tuple[int, ...] | list[int] = (512, 512, 512),
         hidden_dims: tuple[int, ...] | list[int] | None = None,
-        activation: str = "elu",
+        activation: str = "swish",
         num_atoms: int = 151,
         vmin: float = 0.0,
         vmax: float = 150.0,
@@ -373,15 +381,22 @@ class ReppoCritic(nn.Module):
 
         critic_hidden_dims = hidden_dims if hidden_dims is not None else critic_hidden_dims
         critic_hidden_dims = _resolve_hidden_dims(critic_hidden_dims, critic_hidden_dim, num_critic_encoder_layers)
-        feature_dim = critic_hidden_dims[-1] if critic_hidden_dims else critic_hidden_dim
+        if critic_hidden_dims:
+            feature_hidden_dims = critic_hidden_dims[:-1]
+            feature_dim = critic_hidden_dims[-1]
+        else:
+            feature_hidden_dims = ()
+            feature_dim = critic_hidden_dim
         head_hidden_dims = tuple([feature_dim] * max(0, num_critic_head_layers - 1))
         pred_hidden_dims = tuple([feature_dim] * max(0, num_critic_pred_layers - 1))
         self.feature_module = _FCNN(
             self.obs_dim + num_actions,
             feature_dim,
-            critic_hidden_dims,
+            feature_hidden_dims,
             activation=activation if activation is not None else "swish",
             use_norm=use_critic_norm,
+            use_output_norm=use_encoder_norm,
+            output_activation=None,
         )
         self.critic_module = _FCNN(
             feature_dim,
@@ -389,7 +404,9 @@ class ReppoCritic(nn.Module):
             head_hidden_dims,
             activation=activation if activation is not None else "swish",
             use_norm=use_critic_norm,
+            use_output_norm=False,
             input_activation=True,
+            output_activation=None,
         )
         self.pred_module = _FCNN(
             feature_dim,
@@ -397,7 +414,9 @@ class ReppoCritic(nn.Module):
             pred_hidden_dims,
             activation=activation if activation is not None else "swish",
             use_norm=use_critic_norm,
+            use_output_norm=False,
             input_activation=True,
+            output_activation=None,
         )
 
         self.register_buffer(
