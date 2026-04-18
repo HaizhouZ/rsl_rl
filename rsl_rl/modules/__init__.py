@@ -5,6 +5,7 @@
 
 """Building blocks for neural models."""
 
+from .actor_q import ActorQ
 from .cnn import CNN
 from .distribution import Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
 from .mlp import MLP
@@ -12,6 +13,7 @@ from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalN
 from .rnn import RNN, HiddenState
 
 __all__ = [
+    "ActorQ",
     "CNN",
     "MLP",
     "RNN",

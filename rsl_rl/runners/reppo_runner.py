@@ -6,78 +6,43 @@
 from __future__ import annotations
 
 import copy
-import inspect
 import os
 import time
-from contextlib import contextmanager
-from collections.abc import Iterable
-from types import SimpleNamespace
+import warnings
 
 import torch
-import torch.nn.functional as F
 from tensordict import TensorDict
 
+from rsl_rl.algorithms import REPPO
 from rsl_rl.env import VecEnv
-from rsl_rl.models import ReppoCritic, ReppoPolicy
-from rsl_rl.models.reppo_model import hl_gauss
-from rsl_rl.utils import check_nan, resolve_callable, resolve_obs_groups, resolve_optimizer
+from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
+from rsl_rl.modules import ActorQ
+from rsl_rl.storage import ReppoRolloutStorage
+from rsl_rl.utils import check_nan, resolve_obs_groups
 from rsl_rl.utils.logger import Logger
 
 
 class ReppoRunner:
-    """Runner for REPPO training on vectorized environments."""
+    """Official-style REPPO runner with compatibility translation for legacy local configs."""
 
-    policy: ReppoPolicy
-    critic: ReppoCritic
+    alg: REPPO
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
         self.env = env
-        self.cfg = train_cfg
         self.device = device
+        self.cfg = self._translate_train_cfg(copy.deepcopy(train_cfg))
+        self.policy_cfg = self.cfg["policy"]
+        self.alg_cfg = self.cfg["algorithm"]
 
         self._configure_multi_gpu()
 
         obs = self.env.get_observations()
+        self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg["obs_groups"], self._get_default_obs_sets())
 
-        self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg["obs_groups"], ["actor", "critic"])
-
-        policy_cfg = dict(self.cfg["policy"])
-        algorithm_cfg = self.cfg["algorithm"]
-        self.num_learning_epochs = algorithm_cfg.get("num_learning_epochs", 4)
-        self.num_mini_batches = algorithm_cfg.get("num_mini_batches", 32)
-        self.learning_rate = algorithm_cfg.get("learning_rate", 3e-4)
-        self.gamma = algorithm_cfg.get("gamma", 0.99)
-        self.lmbda = algorithm_cfg.get("lmbda", algorithm_cfg.get("lam", 0.95))
-        self.num_atoms = algorithm_cfg.get("num_atoms", 151)
-        self.vmin = algorithm_cfg.get("vmin", 0.0)
-        self.vmax = algorithm_cfg.get("vmax", 150.0)
-        self.aux_loss_mult = algorithm_cfg.get("aux_loss_mult", 0.0)
-        self.kl_bound = algorithm_cfg.get("kl_bound", algorithm_cfg.get("desired_kl", 0.1))
-        self.actor_kl_clip_mode = algorithm_cfg.get("actor_kl_clip_mode", "clipped")
-        self.ent_target_mult = algorithm_cfg.get("ent_target_mult", 0.5)
-        policy_class = resolve_callable(policy_cfg.pop("class_name", "ReppoPolicy"))  # type: ignore
-        critic_class = resolve_callable(policy_cfg.pop("critic_class_name", "ReppoCritic"))  # type: ignore
-        actor_cfg, critic_cfg = self._split_policy_kwargs(policy_class, critic_class, policy_cfg)
-
-        self.policy = policy_class(obs, self.cfg["obs_groups"], self.env.num_actions, **actor_cfg).to(self.device)
-        self.critic = critic_class(
-            obs,
-            self.cfg["obs_groups"],
-            self.env.num_actions,
-            **critic_cfg,
-            num_atoms=self.num_atoms,
-            vmin=self.vmin,
-            vmax=self.vmax,
-            aux_loss_mult=self.aux_loss_mult,
-        ).to(self.device)
-        self.policy_old = copy.deepcopy(self.policy).to(self.device)
-        self.policy_old.eval()
-
-        optimizer_name = algorithm_cfg.get("optimizer", "adamw")
-        self.actor_optimizer = resolve_optimizer(optimizer_name)(self.policy.parameters(), lr=self.learning_rate)
-        self.critic_optimizer = resolve_optimizer(optimizer_name)(
-            self.critic.parameters(), lr=self.learning_rate
-        )
+        self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
+        self.alg_cfg = resolve_symmetry_config(self.alg_cfg, self.env)
+        self.alg = self._construct_algorithm(obs)
+        self.policy = self.alg.policy
 
         self.logger = Logger(
             log_dir=log_dir,
@@ -91,24 +56,6 @@ class ReppoRunner:
         )
 
         self.current_learning_iteration = 0
-        self.pending_transition: dict[str, torch.Tensor] | None = None
-        self.transitions: list[dict[str, torch.Tensor]] = []
-        self.rollout_data: dict[str, torch.Tensor] | None = None
-        self.rollout_metrics: dict[str, float] = {}
-        self.alg = SimpleNamespace(policy=self.policy, critic=self.critic)
-        self.reward_scale = self._resolve_reward_scale()
-
-    @contextmanager
-    def _freeze_module_params(self, module: torch.nn.Module):
-        params = tuple(module.parameters())
-        original_requires_grad = [param.requires_grad for param in params]
-        try:
-            for param in params:
-                param.requires_grad_(False)
-            yield
-        finally:
-            for param, requires_grad in zip(params, original_requires_grad, strict=True):
-                param.requires_grad_(requires_grad)
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         if init_at_random_ep_len:
@@ -120,7 +67,7 @@ class ReppoRunner:
         self.train_mode()
 
         if self.is_distributed:
-            self.broadcast_parameters()
+            self.alg.broadcast_parameters()
 
         self.logger.init_logging_writer()
 
@@ -128,23 +75,32 @@ class ReppoRunner:
         total_it = start_it + num_learning_iterations
         for it in range(start_it, total_it):
             start = time.time()
-            for _ in range(self.cfg["num_steps_per_env"]):
-                actions = self.act(obs)
-                obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
-                if self.cfg.get("check_for_nan", True):
-                    check_nan(obs, rewards, dones)
-                obs = obs.to(self.device)
-                rewards = rewards.to(self.device)
-                dones = dones.to(self.device)
-                self.process_env_step(obs, rewards, dones, extras)
-                self.logger.process_env_step(rewards, dones, extras)
+            with torch.inference_mode():
+                for _ in range(self.cfg["num_steps_per_env"]):
+                    actions = self.alg.act(obs)
+                    if self.alg_cfg.get("scale_actions", False):
+                        upper = self.alg_cfg.get("action_upper_bound", 1.0)
+                        lower = self.alg_cfg.get("action_lower_bound", -1.0)
+                        actions = actions * (upper - lower) / 2.0 + (upper + lower) / 2.0
 
-            stop = time.time()
-            collect_time = stop - start
-            start = stop
+                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    if self.cfg.get("check_for_nan", True):
+                        check_nan(obs, rewards, dones)
+                    obs = obs.to(self.device)
+                    rewards = rewards.to(self.device)
+                    dones = dones.to(self.device)
 
-            self.compute_returns(obs)
-            loss_dict, metric_dict = self.update()
+                    self.alg.process_env_step(obs, rewards, dones, extras)
+                    intrinsic_rewards = self.alg.intrinsic_rewards if self.alg_cfg.get("rnd_cfg") else None
+                    self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards)
+
+                stop = time.time()
+                collect_time = stop - start
+                start = stop
+
+                self.alg.compute_returns(obs)
+
+            loss_dict = self.alg.update()
 
             stop = time.time()
             learn_time = stop - start
@@ -157,385 +113,228 @@ class ReppoRunner:
                 collect_time=collect_time,
                 learn_time=learn_time,
                 loss_dict=loss_dict,
-                metric_dict=metric_dict,
-                learning_rate=self.actor_optimizer.param_groups[0]["lr"],
-                action_std=self.policy.output_std,
-                rnd_weight=None,
+                learning_rate=self.alg.learning_rate,
+                action_std=self.alg.policy.action_std,
+                rnd_weight=self.alg.rnd.weight if self.alg_cfg.get("rnd_cfg") else None,
             )
 
             if self.gpu_global_rank == 0 and self.logger.log_dir is not None and it % self.cfg["save_interval"] == 0:
-                self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore[arg-type]
+                self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))
 
         if self.gpu_global_rank == 0 and self.logger.log_dir is not None:
-            self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore[arg-type]
+            self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))
         self.logger.stop_logging_writer()
 
-    def act(self, obs: TensorDict) -> torch.Tensor:
-        raw_actor_obs = self.policy.get_actor_obs(obs)
-        raw_critic_obs = self.critic.get_critic_obs(obs)
-        actor_obs = self.policy.normalize_actor_obs(raw_actor_obs)
-        actions, log_prob, policy_entropy, _, _, _, _ = self.policy.sample_actions_from_normalized(actor_obs)
-        self.pending_transition = {
-            "observations": raw_actor_obs.detach(),
-            "critic_observations": raw_critic_obs.detach(),
-            "actions": actions.detach(),
-            "log_probs": log_prob.detach(),
-            "entropy": policy_entropy.detach(),
-        }
-        return actions
-
-    def process_env_step(
-        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
-    ) -> None:
-        if self.pending_transition is None:
-            raise RuntimeError("process_env_step called before act")
-
-        effective_next_obs = obs
-        if (
-            self.cfg.get("env", {}).get("has_final_obs", False)
-            and self.cfg.get("env", {}).get("partial_reset", False)
-            and "final_observation" in extras
-        ):
-            maybe_final_obs = extras["final_observation"]
-            if isinstance(maybe_final_obs, TensorDict):
-                effective_next_obs = maybe_final_obs
-
-        next_actor_obs = self.policy.get_actor_obs(effective_next_obs)
-        next_critic_obs = self.critic.get_critic_obs(effective_next_obs)
-
-        truncations = extras.get("time_outs")
-        if truncations is None:
-            truncations = torch.zeros_like(dones)
-
-        rewards = rewards.reshape(rewards.shape[0], -1)
-        dones = dones.reshape(dones.shape[0], -1)
-        truncations = truncations.reshape(truncations.shape[0], -1)
-
-        transition = dict(self.pending_transition)
-        transition.update(
-            {
-                "rewards": rewards.clone().to(dtype=torch.float32),
-                "dones": dones.to(dtype=torch.float32),
-                "truncations": truncations.to(dtype=torch.float32),
-                "next_observations": next_actor_obs.detach(),
-                "next_critic_observations": next_critic_obs.detach(),
-            }
-        )
-        self.transitions.append(transition)
-        self.pending_transition = None
-
-    def compute_returns(self, obs: TensorDict) -> None:
-        if not self.transitions:
-            self.rollout_data = None
-            return
-
-        data = self._stack_transitions(self.transitions)
-        data = self._normalize_rollout(data)
-        rollout_extras = self._compute_rollout_extras(data)
-        data.update(rollout_extras)
-        self.logger.process_algo_rewards("soft_reward", data["rewards"], data["dones"])
-        self.rollout_metrics = {
-            "raw_reward_step": data["raw_rewards"].mean().item(),
-            "soft_reward_step": data["rewards"].mean().item(),
-            "soft_bonus_step": data["soft_bonus"].mean().item(),
-            "mean_next_log_prob": data["next_log_probs"].mean().item(),
-            "temperature": data["temperature"].mean().item(),
-        }
-        data["gve"] = self._compute_gve(
-            rewards=data["rewards"],
-            dones=data["dones"],
-            truncations=data["truncations"],
-            next_values=data["next_values"],
-        )
-        self.rollout_data = data
-
-    def update(self) -> tuple[dict[str, float], dict[str, float]]:
-        if self.rollout_data is None:
-            return {}, {}
-
-        data = self.rollout_data
-        obs = data["observations"].flatten(0, 1)
-        critic_obs = data["critic_observations"].flatten(0, 1)
-        actions = data["actions"].flatten(0, 1)
-        rewards = data["rewards"].flatten(0, 1)
-        dones = data["dones"].flatten(0, 1)
-        truncations = data["truncations"].flatten(0, 1)
-        next_values = data["next_values"].flatten(0, 1)
-        next_embeddings = data["next_embeddings"].flatten(0, 1)
-        gve = data["gve"].flatten(0, 1)
-
-        batch_size = max(1, obs.shape[0] // self.num_mini_batches)
-        indices = torch.arange(obs.shape[0], device=self.device)
-
-        partial_reset = bool(self.cfg.get("env", {}).get("partial_reset", False))
-        truncation_mask = torch.ones_like(truncations) if partial_reset else 1.0 - truncations
-
-        mean_critic_loss = 0.0
-        mean_actor_loss = 0.0
-        mean_entropy = 0.0
-        mean_policy_entropy = 0.0
-        mean_base_entropy = 0.0
-        mean_kl = 0.0
-        mean_embedding_loss = 0.0
-        mean_temperature = 0.0
-        mean_beta = 0.0
-        num_updates = 0
-
-        old_policy = self.policy_old
-
-        for _ in range(self.num_learning_epochs):
-            perm = indices[torch.randperm(indices.numel(), device=self.device)]
-            for start in range(0, perm.numel(), batch_size):
-                batch_idx = perm[start : start + batch_size]
-
-                batch_obs = obs[batch_idx]
-                batch_critic_obs = critic_obs[batch_idx]
-                batch_actions = actions[batch_idx]
-                batch_gve = gve[batch_idx]
-                batch_next_embeddings = next_embeddings[batch_idx]
-                batch_mask = truncation_mask[batch_idx]
-
-                qf_target_dist = hl_gauss(
-                    batch_gve,
-                    self.vmin,
-                    self.vmax,
-                    self.num_atoms,
-                )
-
-                _, logits, _, embedding = self.critic.forward_normalized(batch_critic_obs, batch_actions)
-                qf_loss = -(
-                    batch_mask * torch.sum(qf_target_dist * F.log_softmax(logits, dim=-1), dim=-1)
-                ).mean()
-                embedding_loss = (
-                    batch_mask
-                    * F.mse_loss(embedding, batch_next_embeddings, reduction="none")
-                ).mean()
-                critic_loss = qf_loss + self.aux_loss_mult * embedding_loss
-
-                self.critic_optimizer.zero_grad(set_to_none=True)
-                critic_loss.backward()
-                if self.is_distributed:
-                    self.reduce_parameters(self.critic.parameters())
-                torch.nn.utils.clip_grad_norm_(
-                    self.critic.parameters(), self.cfg["algorithm"].get("max_grad_norm", 1.0)
-                )
-                self.critic_optimizer.step()
-
-                # Actor update
-                (
-                    new_actions,
-                    log_probs,
-                    policy_entropy,
-                    base_entropy,
-                    _,
-                    temperature,
-                    beta,
-                ) = self.policy.sample_actions_from_normalized(batch_obs)
-                with self._freeze_module_params(self.critic):
-                    qf, _, _, _ = self.critic.forward_normalized(batch_critic_obs, new_actions)
-
-                with torch.no_grad():
-                    old_dist = old_policy.build_distribution_from_normalized(batch_obs)
-                    old_actions = old_dist.sample((16,)).clip(-1 + 1e-6, 1 - 1e-6)
-                    old_log_probs = old_dist.log_prob(old_actions).sum(dim=-1).mean(dim=0)
-                new_dist = self.policy.build_distribution_from_normalized(batch_obs)
-                new_log_probs = new_dist.log_prob(old_actions).sum(dim=-1).mean(dim=0)
-                kl = old_log_probs - new_log_probs
-
-                actor_loss = -qf + temperature.detach() * log_probs
-
-                if self.actor_kl_clip_mode == "clipped":
-                    actor_loss = torch.where(kl < self.kl_bound, actor_loss, kl * beta.detach())
-                elif self.actor_kl_clip_mode == "full":
-                    actor_loss = actor_loss + kl * beta.detach()
-                elif self.actor_kl_clip_mode == "value":
-                    actor_loss = actor_loss
-                else:
-                    raise ValueError(f"Unknown actor_kl_clip_mode: {self.actor_kl_clip_mode}")
-
-                target_entropy = new_actions.shape[-1] * self.ent_target_mult
-                # Drive the squashed-policy entropy surrogate toward the configured target.
-                entropy_loss = (policy_entropy - target_entropy).detach().mean() * temperature
-                lagrangian_loss = (-beta * (kl - self.kl_bound).mean().detach())
-                actor_loss = (actor_loss + entropy_loss + lagrangian_loss).mean()
-
-                self.actor_optimizer.zero_grad(set_to_none=True)
-                actor_loss.backward()
-                if self.is_distributed:
-                    self.reduce_parameters(self.policy.parameters())
-                torch.nn.utils.clip_grad_norm_(
-                    self.policy.parameters(), self.cfg["algorithm"].get("max_grad_norm", 1.0)
-                )
-                self.actor_optimizer.step()
-
-                mean_critic_loss += critic_loss.item()
-                mean_actor_loss += actor_loss.item()
-                mean_entropy += policy_entropy.mean().item()
-                mean_policy_entropy += policy_entropy.mean().item()
-                mean_base_entropy += base_entropy.mean().item()
-                mean_kl += kl.mean().item()
-                mean_embedding_loss += embedding_loss.item()
-                mean_temperature += temperature.mean().item()
-                mean_beta += beta.mean().item()
-                num_updates += 1
-
-        if num_updates == 0:
-            raise RuntimeError("REPPO update produced zero optimization batches")
-
-        mean_critic_loss /= num_updates
-        mean_actor_loss /= num_updates
-        mean_entropy /= num_updates
-        mean_policy_entropy /= num_updates
-        mean_base_entropy /= num_updates
-        mean_kl /= num_updates
-        mean_embedding_loss /= num_updates
-        mean_temperature /= num_updates
-        mean_beta /= num_updates
-
-        self.transitions.clear()
-        self.rollout_data = None
-        self.policy_old.load_state_dict(self.policy.state_dict())
-
-        loss_dict = {
-            "critic": mean_critic_loss,
-            "actor": mean_actor_loss,
-            "entropy": mean_entropy,
-            "kl": mean_kl,
-            "embedding": mean_embedding_loss,
-        }
-        metric_dict = dict(self.rollout_metrics)
-        metric_dict["temperature"] = mean_temperature
-        metric_dict["beta"] = mean_beta
-        metric_dict["policy_entropy"] = mean_policy_entropy
-        metric_dict["base_entropy"] = mean_base_entropy
-        metric_dict["target_entropy"] = target_entropy
-        self.rollout_metrics = {}
-        return loss_dict, metric_dict
-
-    def train_mode(self) -> None:
-        self.policy.train()
-        self.critic.train()
-
-    def eval_mode(self) -> None:
-        self.policy.eval()
-        self.critic.eval()
-
     def save(self, path: str, infos: dict | None = None) -> None:
-        saved_dict = self._build_save_dict(infos=infos)
-        torch.save(saved_dict, path)
-        self.logger.save_model(path, self.current_learning_iteration)
-
-    def _build_save_dict(self, infos: dict | None = None) -> dict:
-        env_state = {}
-        if hasattr(self.env, "unwrapped") and hasattr(self.env.unwrapped, "common_step_counter"):
-            env_state["common_step_counter"] = self.env.unwrapped.common_step_counter
-        return {
-            "policy_state_dict": self.policy.state_dict(),
-            "critic_state_dict": self.critic.state_dict(),
-            "policy_old_state_dict": self.policy_old.state_dict(),
-            "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
-            "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
+        saved_dict = {
+            "model_state_dict": self.alg.policy.state_dict(),
+            "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
-            "env_state": env_state,
         }
+        if self.alg_cfg.get("rnd_cfg"):
+            saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
+            if self.alg.rnd_optimizer is not None:
+                saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
 
-    def load(
-        self,
-        path: str,
-        load_optimizer: bool = True,
-        strict: bool = True,
-        map_location: str | None = None,
-    ) -> dict:
+        torch.save(saved_dict, path)
+        if getattr(self.logger, "writer", None) is not None:
+            self.logger.save_model(path, self.current_learning_iteration)
+
+    def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None) -> dict | None:
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
-        self.policy.load_state_dict(loaded_dict["policy_state_dict"], strict=strict)
-        self.policy_old.load_state_dict(loaded_dict["policy_old_state_dict"], strict=strict)
-        self.critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
+
+        self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
+        if self.alg_cfg.get("rnd_cfg"):
+            self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+
         if load_optimizer:
-            self.actor_optimizer.load_state_dict(loaded_dict["actor_optimizer_state_dict"])
-            self.critic_optimizer.load_state_dict(loaded_dict["critic_optimizer_state_dict"])
-        if getattr(self.policy, "reset_global_std_on_resume", False) and not self.policy.state_dependent_std:
-            self.policy.reset_std_to_init()
-            self.policy_old.reset_std_to_init()
-            self._reset_global_std_optimizer_state()
-        self.current_learning_iteration = loaded_dict["iter"] + 1
-        if "env_state" in loaded_dict and hasattr(self.env, "unwrapped"):
-            env_state = loaded_dict["env_state"] or {}
-            if "common_step_counter" in env_state and hasattr(self.env.unwrapped, "common_step_counter"):
-                self.env.unwrapped.common_step_counter = env_state["common_step_counter"]
-        return loaded_dict.get("infos") or {}
+            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            if self.alg_cfg.get("rnd_cfg") and self.alg.rnd_optimizer is not None:
+                rnd_optimizer_state = loaded_dict.get("rnd_optimizer_state_dict")
+                if rnd_optimizer_state is not None:
+                    self.alg.rnd_optimizer.load_state_dict(rnd_optimizer_state)
 
-    def get_inference_policy(self, device: str | None = None) -> ReppoPolicy:
-        self.policy.eval()
-        return self.policy.to(device) if device is not None else self.policy
+        self.current_learning_iteration = loaded_dict.get("iter", 0)
+        return loaded_dict.get("infos")
 
-    def get_policy(self) -> ReppoPolicy:
-        return self.policy
+    def get_inference_policy(self, device: str | None = None) -> callable:
+        self.eval_mode()
+        if device is not None:
+            self.alg.policy.to(device)
+        return self.alg.policy.act_inference
+
+    def train_mode(self) -> None:
+        self.alg.policy.train()
+        if self.alg_cfg.get("rnd_cfg"):
+            self.alg.rnd.train()
+
+    def eval_mode(self) -> None:
+        self.alg.policy.eval()
+        if self.alg_cfg.get("rnd_cfg"):
+            self.alg.rnd.eval()
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
         self.logger.git_status_repos.append(repo_file_path)
 
-    def _reset_global_std_optimizer_state(self) -> None:
-        param_and_slice = self.policy.get_global_std_bias_parameter()
-        if param_and_slice is None:
-            return
-        param, std_slice = param_and_slice
-        state = self.actor_optimizer.state.get(param)
-        if state is None:
-            return
-        for value in state.values():
-            if torch.is_tensor(value) and value.shape == param.shape:
-                value[std_slice].zero_()
+    def _construct_algorithm(self, obs: TensorDict) -> REPPO:
+        policy = ActorQ(obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg).to(self.device)
+        storage = ReppoRolloutStorage(
+            "rl", self.env.num_envs, self.cfg["num_steps_per_env"], obs, [self.env.num_actions], self.device
+        )
+        return REPPO(policy, storage, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
 
-    def _resolve_reward_scale(self) -> float:
-        env_cfg = getattr(self.env, "cfg", None)
-        if env_cfg is None:
-            return 1.0
-        scale_rewards_by_dt = getattr(env_cfg, "scale_rewards_by_dt", None)
-        if scale_rewards_by_dt is None and isinstance(env_cfg, dict):
-            scale_rewards_by_dt = env_cfg.get("scale_rewards_by_dt")
-        if not scale_rewards_by_dt:
-            return 1.0
-        unwrapped_env = getattr(self.env, "unwrapped", self.env)
-        step_dt = getattr(unwrapped_env, "step_dt", None)
-        if step_dt is None:
-            return 1.0
-        return float(step_dt)
+    def _get_default_obs_sets(self) -> list[str]:
+        default_sets = ["policy", "critic"]
+        if self.alg_cfg.get("rnd_cfg") is not None:
+            default_sets.append("rnd_state")
+        return default_sets
 
-    def broadcast_parameters(self) -> None:
-        model_params = [self.policy.state_dict(), self.critic.state_dict()]
-        torch.distributed.broadcast_object_list(model_params, src=0)
-        self.policy.load_state_dict(model_params[0])
-        self.critic.load_state_dict(model_params[1])
-        self.policy_old.load_state_dict(model_params[0])
+    @staticmethod
+    def _translate_train_cfg(train_cfg: dict) -> dict:
+        cfg = copy.deepcopy(train_cfg)
+        cfg["obs_groups"] = ReppoRunner._translate_obs_groups(cfg.get("obs_groups", {}))
 
-    def reduce_parameters(self, params: Iterable[torch.nn.Parameter] | None = None) -> None:
-        all_params = list(params) if params is not None else list(self.policy.parameters()) + list(self.critic.parameters())
-        grads = [param.grad.view(-1) for param in all_params if param.grad is not None]
-        if not grads:
-            return
-        all_grads = torch.cat(grads)
-        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
-        all_grads /= self.gpu_world_size
-        offset = 0
-        for param in all_params:
-            if param.grad is not None:
-                numel = param.numel()
-                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
-                offset += numel
+        policy_cfg = dict(cfg.get("policy", {}))
+        algorithm_cfg = dict(cfg.get("algorithm", {}))
+
+        actor_hidden_dims = ReppoRunner._resolve_actor_hidden_dims(policy_cfg)
+        critic_hidden_dims = ReppoRunner._resolve_critic_hidden_dims(policy_cfg)
+
+        translated_policy = {
+            "actor_obs_normalization": policy_cfg.pop("actor_obs_normalization", False),
+            "critic_obs_normalization": policy_cfg.pop("critic_obs_normalization", False),
+            "actor_hidden_dims": actor_hidden_dims,
+            "critic_hidden_dims": critic_hidden_dims,
+            "num_critic_bins": algorithm_cfg.pop("num_atoms", 151),
+            "vmin": algorithm_cfg.pop("vmin", -10.0),
+            "vmax": algorithm_cfg.pop("vmax", 10.0),
+            "activation": policy_cfg.pop("activation", "elu"),
+            "init_noise_std": policy_cfg.pop("init_noise_std", 1.0),
+            "noise_std_type": policy_cfg.pop("noise_std_type", "scalar"),
+            "state_dependent_std": policy_cfg.pop("state_dependent_std", True),
+            "distribution_type": policy_cfg.pop("distribution_type", "tanh"),
+            "init_alpha_temp": policy_cfg.pop("ent_start", 0.001),
+            "init_alpha_kl": policy_cfg.pop("kl_start", 0.01),
+            "action_lower_bound": policy_cfg.pop("action_lower_bound", -1.0),
+            "action_upper_bound": policy_cfg.pop("action_upper_bound", 1.0),
+        }
+
+        policy_cfg.pop("class_name", None)
+        policy_cfg.pop("critic_class_name", None)
+        ignored_policy = {
+            key: policy_cfg.pop(key)
+            for key in list(policy_cfg)
+            if key
+            in {
+                "actor_min_std",
+                "reset_global_std_on_resume",
+                "use_actor_norm",
+                "use_critic_norm",
+                "use_encoder_norm",
+                "num_critic_pred_layers",
+            }
+        }
+        ReppoRunner._warn_ignored_fields("policy", ignored_policy)
+        ReppoRunner._warn_ignored_fields("policy", policy_cfg)
+
+        target_entropy = algorithm_cfg.pop("target_entropy", None)
+        if target_entropy is None:
+            target_entropy = -abs(float(algorithm_cfg.pop("ent_target_mult", 0.5)))
+        else:
+            target_entropy = float(target_entropy)
+
+        translated_algorithm = {
+            "num_learning_epochs": algorithm_cfg.pop("num_learning_epochs", 4),
+            "num_mini_batches": algorithm_cfg.pop("num_mini_batches", 4),
+            "gamma": algorithm_cfg.pop("gamma", 0.99),
+            "lam": algorithm_cfg.pop("lam", algorithm_cfg.pop("lmbda", 0.95)),
+            "learning_rate": algorithm_cfg.pop("learning_rate", 3e-4),
+            "max_grad_norm": algorithm_cfg.pop("max_grad_norm", 0.5),
+            "desired_kl": algorithm_cfg.pop("kl_bound", algorithm_cfg.pop("desired_kl", 0.01)),
+            "target_entropy": target_entropy,
+            "rnd_cfg": algorithm_cfg.pop("rnd_cfg", None),
+            "symmetry_cfg": algorithm_cfg.pop("symmetry_cfg", None),
+            "scale_actions": algorithm_cfg.pop("scale_actions", False),
+            "action_lower_bound": translated_policy["action_lower_bound"],
+            "action_upper_bound": translated_policy["action_upper_bound"],
+        }
+
+        algorithm_cfg.pop("class_name", None)
+        ignored_algorithm = {
+            key: algorithm_cfg.pop(key)
+            for key in list(algorithm_cfg)
+            if key
+            in {
+                "aux_loss_mult",
+                "actor_kl_clip_mode",
+                "schedule",
+                "optimizer",
+                "entropy_coef",
+                "value_loss_coef",
+                "use_clipped_value_loss",
+                "clip_param",
+                "normalize_advantage_per_mini_batch",
+            }
+        }
+        ReppoRunner._warn_ignored_fields("algorithm", ignored_algorithm)
+        ReppoRunner._warn_ignored_fields("algorithm", algorithm_cfg)
+
+        cfg["policy"] = translated_policy
+        cfg["algorithm"] = translated_algorithm
+        return cfg
+
+    @staticmethod
+    def _translate_obs_groups(obs_groups: dict[str, list[str] | tuple[str, ...]]) -> dict[str, list[str] | tuple[str, ...]]:
+        translated = copy.deepcopy(obs_groups)
+        if "policy" not in translated and "actor" in translated:
+            translated["policy"] = translated.pop("actor")
+        return translated
+
+    @staticmethod
+    def _resolve_actor_hidden_dims(policy_cfg: dict) -> tuple[int, ...]:
+        actor_hidden_dims = tuple(policy_cfg.pop("actor_hidden_dims", ()))
+        actor_hidden_dim = int(policy_cfg.pop("actor_hidden_dim", 512))
+        num_actor_layers = int(policy_cfg.pop("num_actor_layers", 3))
+        if actor_hidden_dims:
+            return actor_hidden_dims
+        return tuple(actor_hidden_dim for _ in range(max(num_actor_layers - 1, 1)))
+
+    @staticmethod
+    def _resolve_critic_hidden_dims(policy_cfg: dict) -> tuple[int, ...]:
+        critic_hidden_dims = tuple(policy_cfg.pop("critic_hidden_dims", ()))
+        critic_hidden_dim = int(policy_cfg.pop("critic_hidden_dim", 512))
+        num_critic_encoder_layers = int(policy_cfg.pop("num_critic_encoder_layers", 2))
+        num_critic_head_layers = int(policy_cfg.pop("num_critic_head_layers", 2))
+        total_hidden_layers = max(num_critic_encoder_layers + num_critic_head_layers - 1, 1)
+        if critic_hidden_dims:
+            if len(critic_hidden_dims) == 1:
+                return (critic_hidden_dims[0], critic_hidden_dims[0])
+            return critic_hidden_dims
+        return tuple(critic_hidden_dim for _ in range(total_hidden_layers))
+
+    @staticmethod
+    def _warn_ignored_fields(scope: str, ignored_cfg: dict) -> None:
+        if ignored_cfg:
+            warnings.warn(
+                f"REPPO {scope} options are ignored by the official ActorQ/REPPO port: {sorted(ignored_cfg)}",
+                stacklevel=3,
+            )
 
     def _configure_multi_gpu(self) -> None:
         self.gpu_world_size = int(os.getenv("WORLD_SIZE", "1"))
         self.is_distributed = self.gpu_world_size > 1
+
         if not self.is_distributed:
             self.gpu_local_rank = 0
             self.gpu_global_rank = 0
-            self.cfg["multi_gpu"] = None
+            self.multi_gpu_cfg = None
             return
 
         self.gpu_local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.gpu_global_rank = int(os.getenv("RANK", "0"))
-        self.cfg["multi_gpu"] = {
+
+        self.multi_gpu_cfg = {
             "global_rank": self.gpu_global_rank,
             "local_rank": self.gpu_local_rank,
             "world_size": self.gpu_world_size,
@@ -556,95 +355,3 @@ class ReppoRunner:
 
         torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
         torch.cuda.set_device(self.gpu_local_rank)
-
-    def _stack_transitions(self, transitions: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-        keys = transitions[0].keys()
-        stacked: dict[str, torch.Tensor] = {}
-        for key in keys:
-            stacked[key] = torch.stack([transition[key] for transition in transitions], dim=0)
-        return stacked
-
-    def _compute_gve(
-        self,
-        rewards: torch.Tensor,
-        dones: torch.Tensor,
-        truncations: torch.Tensor,
-        next_values: torch.Tensor,
-    ) -> torch.Tensor:
-        gves = []
-        last_gve = torch.zeros_like(next_values[0])
-        truncations = truncations.clone()
-        truncations[-1] = 1.0
-        for t in reversed(range(self.cfg["num_steps_per_env"])):
-            lambda_sum = self.lmbda * last_gve + (1.0 - self.lmbda) * next_values[t]
-            delta = self.gamma * torch.where(
-                truncations[t].bool(), next_values[t], (1.0 - dones[t]) * lambda_sum
-            )
-            last_gve = rewards[t] + delta
-            gves.insert(0, last_gve)
-        return torch.stack(gves)
-
-    def _compute_rollout_extras(self, data: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        next_obs = data["next_observations"]
-        next_critic_obs = data["next_critic_observations"]
-        rewards = data["rewards"]
-
-        with torch.inference_mode():
-            next_dist = self.policy.build_distribution_from_normalized(next_obs)
-            next_actions = next_dist.sample()
-            next_log_probs = next_dist.log_prob(next_actions.clip(-1 + 1e-6, 1 - 1e-6)).sum(dim=-1, keepdim=True)
-            temperature = torch.exp(self.policy.log_temp)
-            soft_bonus = -self.gamma * next_log_probs * temperature * self.reward_scale
-            soft_rewards = rewards + soft_bonus
-            next_values, _, _, next_embeddings = self.critic.forward_normalized(next_critic_obs, next_actions)
-
-        return {
-            "raw_rewards": rewards.to(dtype=torch.float32),
-            "rewards": soft_rewards.to(dtype=torch.float32),
-            "soft_bonus": soft_bonus.to(dtype=torch.float32),
-            "next_log_probs": next_log_probs.to(dtype=torch.float32),
-            "temperature": torch.full_like(rewards, float(temperature.item()), dtype=torch.float32),
-            "next_values": next_values.unsqueeze(-1).to(dtype=torch.float32),
-            "next_embeddings": next_embeddings.to(dtype=torch.float32),
-        }
-
-    def _normalize_rollout(self, data: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        observations = data["observations"]
-        critic_observations = data["critic_observations"]
-        next_observations = data["next_observations"]
-        next_critic_observations = data["next_critic_observations"]
-
-        normalized_data = dict(data)
-        normalized_data["observations"] = self.policy.normalize_actor_obs(observations).detach()
-        normalized_data["critic_observations"] = self.critic.normalize_critic_obs(critic_observations).detach()
-        normalized_data["next_observations"] = self.policy.normalize_actor_obs(next_observations).detach()
-        normalized_data["next_critic_observations"] = self.critic.normalize_critic_obs(next_critic_observations).detach()
-
-        if self.policy.actor_obs_normalization:
-            actor_obs_update = torch.cat([observations, next_observations], dim=0)
-            self.policy.actor_obs_normalizer.update(actor_obs_update.flatten(0, -2))  # type: ignore[operator]
-        if self.critic.critic_obs_normalization:
-            critic_obs_update = torch.cat([critic_observations, next_critic_observations], dim=0)
-            self.critic.critic_obs_normalizer.update(critic_obs_update.flatten(0, -2))  # type: ignore[operator]
-
-        return normalized_data
-
-    @staticmethod
-    def _constructor_kwargs(constructor: type) -> set[str]:
-        parameters = inspect.signature(constructor.__init__).parameters
-        ignored = {"self", "obs", "obs_groups", "num_actions", "kwargs"}
-        return {name for name, param in parameters.items() if name not in ignored and param.kind != inspect.Parameter.VAR_KEYWORD}
-
-    def _split_policy_kwargs(self, policy_class: type, critic_class: type, shared_cfg: dict) -> tuple[dict, dict]:
-        actor_allowed = self._constructor_kwargs(policy_class)
-        critic_allowed = self._constructor_kwargs(critic_class)
-
-        actor_cfg = {key: value for key, value in shared_cfg.items() if key in actor_allowed}
-        critic_cfg = {key: value for key, value in shared_cfg.items() if key in critic_allowed}
-
-        unsupported = set(shared_cfg) - actor_allowed - critic_allowed
-        if unsupported:
-            unsupported_list = ", ".join(sorted(unsupported))
-            raise ValueError(f"Unsupported REPPO policy config keys: {unsupported_list}")
-
-        return actor_cfg, critic_cfg

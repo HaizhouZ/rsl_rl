@@ -8,5 +8,6 @@
 from .distillation import Distillation
 from .fast_td3 import FastTD3
 from .ppo import PPO
+from .reppo import REPPO
 
-__all__ = ["PPO", "Distillation", "FastTD3"]
+__all__ = ["PPO", "REPPO", "Distillation", "FastTD3"]
