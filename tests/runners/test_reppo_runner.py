@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import types
 from unittest import mock
 
@@ -23,8 +24,8 @@ class DummyEnv(VecEnv):
         self.max_episode_length = 8
         self.episode_length_buf = torch.zeros(1, dtype=torch.long)
         self.device = "cpu"
-        self.cfg = {}
-        self.unwrapped = types.SimpleNamespace(common_step_counter=0)
+        self.cfg = {"scale_rewards_by_dt": False}
+        self.unwrapped = types.SimpleNamespace(common_step_counter=0, step_dt=0.02)
 
     def get_observations(self) -> TensorDict:
         return TensorDict(
@@ -39,7 +40,17 @@ class DummyEnv(VecEnv):
         raise NotImplementedError
 
 
-def _make_runner(num_steps_per_env: int = 2) -> ReppoRunner:
+def _make_runner(num_steps_per_env: int = 2, policy_overrides: dict | None = None) -> ReppoRunner:
+    policy_cfg = {
+        "class_name": "ReppoPolicy",
+        "critic_class_name": "ReppoCritic",
+        "actor_hidden_dims": [8],
+        "critic_hidden_dims": [8],
+        "actor_obs_normalization": False,
+        "critic_obs_normalization": False,
+    }
+    if policy_overrides:
+        policy_cfg.update(policy_overrides)
     return ReppoRunner(
         DummyEnv(),
         {
@@ -47,20 +58,12 @@ def _make_runner(num_steps_per_env: int = 2) -> ReppoRunner:
             "save_interval": 100,
             "obs_groups": {"actor": ["policy"], "critic": ["critic"]},
             "env": {"partial_reset": True, "has_final_obs": True},
-            "policy": {
-                "class_name": "ReppoPolicy",
-                "critic_class_name": "ReppoCritic",
-                "actor_hidden_dims": [8],
-                "critic_hidden_dims": [8],
-                "actor_obs_normalization": False,
-                "critic_obs_normalization": False,
-            },
+            "policy": policy_cfg,
             "algorithm": {
                 "learning_rate": 3e-4,
                 "gamma": 0.99,
                 "num_mini_batches": 1,
                 "num_learning_epochs": 1,
-                "num_action_samples": 3,
             },
         },
         log_dir=None,
@@ -68,7 +71,7 @@ def _make_runner(num_steps_per_env: int = 2) -> ReppoRunner:
     )
 
 
-def test_compute_returns_uses_final_observation_and_monte_carlo_next_values() -> None:
+def test_compute_returns_uses_final_observation_for_single_sample_next_targets() -> None:
     runner = _make_runner(num_steps_per_env=1)
     obs = runner.env.get_observations()
 
@@ -77,6 +80,7 @@ def test_compute_returns_uses_final_observation_and_monte_carlo_next_values() ->
             torch.full((1, 2), 0.25),
             torch.tensor([0.5]),
             torch.tensor([-0.5]),
+            torch.tensor([2.5]),
             torch.full((1, 2), 0.1),
             torch.tensor(2.0),
             torch.tensor(3.0),
@@ -87,16 +91,9 @@ def test_compute_returns_uses_final_observation_and_monte_carlo_next_values() ->
     class FakeDist:
         def __init__(self, obs: torch.Tensor) -> None:
             self.obs = obs
-            self._sample_cursor = 0
 
         def sample(self, sample_shape: tuple[int, ...] = torch.Size()) -> torch.Tensor:
             seen_next_obs.append(self.obs.clone())
-            if sample_shape:
-                chunk_size = sample_shape[0]
-                base = torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32)
-                values = base[self._sample_cursor : self._sample_cursor + chunk_size]
-                self._sample_cursor += chunk_size
-                return values.view(chunk_size, 1, 1, 1).expand(chunk_size, 1, 1, 2)
             return torch.tensor([[[0.4, 0.4]]], dtype=torch.float32)
 
         def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
@@ -106,22 +103,17 @@ def test_compute_returns_uses_final_observation_and_monte_carlo_next_values() ->
         return FakeDist(normalized_obs)
 
     def fake_forward_normalized(self, obs: torch.Tensor, action: torch.Tensor):
-        if obs.dim() == 4:
-            values = action[..., :1] * 10.0
-            embeddings = torch.ones(obs.shape[0], obs.shape[1], obs.shape[2], 8, dtype=torch.float32) * 9.0
-            return values, torch.zeros(*values.shape, self.num_atoms), torch.ones_like(embeddings), embeddings
-        return (
-            torch.tensor([[7.0]]),
-            torch.zeros(1, self.num_atoms),
-            torch.ones(1, 8),
-            torch.ones(1, 8) * 9.0,
-        )
+        values = action[..., :1] * 10.0
+        embeddings = torch.ones(*values.shape[:-1], 8, dtype=torch.float32) * 9.0
+        return values, torch.zeros(*values.shape, self.num_atoms), torch.ones_like(embeddings), embeddings
 
     runner.policy.sample_actions_from_normalized = types.MethodType(fake_sample_actions_from_normalized, runner.policy)
     runner.policy.build_distribution_from_normalized = types.MethodType(
         fake_build_distribution_from_normalized, runner.policy
     )
     runner.critic.forward_normalized = types.MethodType(fake_forward_normalized, runner.critic)
+    with torch.no_grad():
+        runner.policy.log_temp.fill_(0.0)
 
     runner.act(obs)
 
@@ -153,12 +145,12 @@ def test_compute_returns_uses_final_observation_and_monte_carlo_next_values() ->
     runner.compute_returns(next_obs)
 
     assert torch.allclose(seen_next_obs[0], final_obs["policy"].unsqueeze(0))
-    assert torch.allclose(runner.rollout_data["rewards"], torch.tensor([[[4.99505]]]), atol=1e-6)
-    assert torch.allclose(runner.rollout_data["next_values"], torch.tensor([[[2.0]]]), atol=1e-6)
+    assert torch.allclose(runner.rollout_data["rewards"], torch.tensor([[[4.505]]]), atol=1e-6)
+    assert torch.allclose(runner.rollout_data["next_values"], torch.tensor([[[4.0]]]), atol=1e-6)
     assert torch.allclose(runner.rollout_data["next_embeddings"], torch.ones(1, 1, 8) * 9.0)
 
 
-def test_compute_returns_uses_shifted_next_actions_for_non_truncated_steps() -> None:
+def test_compute_returns_uses_sampled_next_actions_for_non_truncated_steps() -> None:
     runner = _make_runner()
     obs = runner.env.get_observations()
 
@@ -173,6 +165,7 @@ def test_compute_returns_uses_shifted_next_actions_for_non_truncated_steps() -> 
             action,
             torch.tensor([0.0]),
             torch.tensor([0.0]),
+            torch.tensor([2.0]),
             action,
             torch.tensor(1.0),
             torch.tensor(1.0),
@@ -182,8 +175,6 @@ def test_compute_returns_uses_shifted_next_actions_for_non_truncated_steps() -> 
 
     class FakeDist:
         def sample(self, sample_shape: tuple[int, ...] = torch.Size()) -> torch.Tensor:
-            if sample_shape:
-                return torch.zeros(*sample_shape, 2, 1, 2, dtype=torch.float32)
             return torch.tensor(
                 [
                     [[0.31, 0.32]],
@@ -201,9 +192,12 @@ def test_compute_returns_uses_shifted_next_actions_for_non_truncated_steps() -> 
 
     def fake_forward_normalized(self, obs: torch.Tensor, action: torch.Tensor):
         value_shape = action.shape[:-1]
-        values = torch.ones(value_shape, dtype=torch.float32)
-        embeddings = torch.ones(*value_shape, 8, dtype=torch.float32)
-        return values, torch.zeros(*value_shape, self.num_atoms), torch.ones_like(embeddings), embeddings
+        anchor = next(self.parameters()).sum() * 0.0
+        values = anchor + torch.ones(value_shape, dtype=torch.float32)
+        logits = anchor + torch.zeros(*value_shape, self.num_atoms, dtype=torch.float32)
+        pred = anchor + torch.ones(*value_shape, 8, dtype=torch.float32)
+        embeddings = anchor + torch.ones(*value_shape, 8, dtype=torch.float32)
+        return values, logits, pred, embeddings
 
     runner.policy.sample_actions_from_normalized = types.MethodType(fake_sample_actions_from_normalized, runner.policy)
     runner.policy.build_distribution_from_normalized = types.MethodType(
@@ -234,9 +228,9 @@ def test_compute_returns_uses_shifted_next_actions_for_non_truncated_steps() -> 
 
     runner.compute_returns(third_obs)
 
-    true_next_actions = recorded_log_prob_actions[0]
-    assert torch.allclose(true_next_actions[0], torch.tensor([[0.21, 0.22]]), atol=1e-6)
-    assert torch.allclose(true_next_actions[1], torch.tensor([[0.41, 0.42]]), atol=1e-6)
+    sampled_next_actions = recorded_log_prob_actions[0]
+    assert torch.allclose(sampled_next_actions[0], torch.tensor([[0.31, 0.32]]), atol=1e-6)
+    assert torch.allclose(sampled_next_actions[1], torch.tensor([[0.41, 0.42]]), atol=1e-6)
 
 
 def test_reppo_runner_initializes_distributed_process_group() -> None:
@@ -360,3 +354,259 @@ def test_reppo_normalization_updates_include_next_observations() -> None:
     assert len(critic_updates) == 1
     assert torch.allclose(actor_updates[0], torch.tensor([[1.0, 2.0], [5.0, 6.0]]))
     assert torch.allclose(critic_updates[0], torch.tensor([[3.0, 4.0], [7.0, 8.0]]))
+
+
+def test_reppo_update_uses_policy_entropy_for_loss_and_logs_base_entropy() -> None:
+    runner = _make_runner(num_steps_per_env=1)
+    runner.rollout_data = {
+        "observations": torch.zeros(1, 1, 2),
+        "critic_observations": torch.zeros(1, 1, 2),
+        "actions": torch.zeros(1, 1, 2),
+        "rewards": torch.zeros(1, 1, 1),
+        "dones": torch.zeros(1, 1, 1),
+        "truncations": torch.zeros(1, 1, 1),
+        "next_values": torch.zeros(1, 1, 1),
+        "next_embeddings": torch.zeros(1, 1, 8),
+        "gve": torch.zeros(1, 1, 1),
+    }
+    runner.rollout_metrics = {}
+
+    def fake_sample_actions_from_normalized(self, normalized_obs: torch.Tensor):
+        batch = normalized_obs.shape[0]
+        anchor = next(self.parameters()).sum() * 0.0
+        return (
+            anchor + torch.zeros(batch, 2),
+            anchor + torch.zeros(batch),
+            anchor + torch.full((batch,), 3.0),
+            anchor + torch.full((batch,), 5.0),
+            anchor + torch.zeros(batch, 2),
+            anchor + torch.tensor(1.0),
+            anchor + torch.tensor(1.0),
+        )
+
+    def fake_build_distribution_from_normalized(self, normalized_obs: torch.Tensor):
+        class FakeDist:
+            def sample(self, sample_shape: tuple[int, ...] = torch.Size()) -> torch.Tensor:
+                return torch.zeros(*sample_shape, normalized_obs.shape[0], 2)
+
+            def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+                return torch.zeros(actions.shape[:-1], dtype=torch.float32)
+
+        return FakeDist()
+
+    def fake_forward_normalized(self, obs: torch.Tensor, action: torch.Tensor):
+        batch_shape = action.shape[:-1]
+        anchor = next(self.parameters()).sum() * 0.0
+        values = anchor + torch.zeros(batch_shape, dtype=torch.float32)
+        logits = anchor + torch.zeros(*batch_shape, self.num_atoms, dtype=torch.float32)
+        pred = anchor + torch.zeros(*batch_shape, 8, dtype=torch.float32)
+        embed = anchor + torch.zeros(*batch_shape, 8, dtype=torch.float32)
+        return values, logits, pred, embed
+
+    runner.policy.sample_actions_from_normalized = types.MethodType(fake_sample_actions_from_normalized, runner.policy)
+    runner.policy.build_distribution_from_normalized = types.MethodType(
+        fake_build_distribution_from_normalized, runner.policy
+    )
+    runner.critic.forward_normalized = types.MethodType(fake_forward_normalized, runner.critic)
+
+    loss_dict, metric_dict = runner.update()
+
+    assert loss_dict["entropy"] == 3.0
+    assert loss_dict["actor"] > 1.0
+    assert metric_dict["policy_entropy"] == 3.0
+    assert metric_dict["base_entropy"] == 5.0
+
+
+def test_reppo_actor_step_freezes_critic_parameters_but_keeps_action_gradient() -> None:
+    runner = _make_runner(num_steps_per_env=1)
+    batch_critic_obs = torch.zeros(1, 2, dtype=torch.float32)
+    actions = torch.zeros(1, 2, dtype=torch.float32, requires_grad=True)
+
+    for param in runner.critic.parameters():
+        param.grad = None
+
+    with runner._freeze_module_params(runner.critic):
+        qf, _, _, _ = runner.critic.forward_normalized(batch_critic_obs, actions)
+        qf.sum().backward()
+
+    assert actions.grad is not None
+    assert actions.grad.abs().sum().item() > 0.0
+    assert all(param.grad is None for param in runner.critic.parameters())
+
+
+def test_reppo_runner_clips_actions_for_log_prob() -> None:
+    runner = _make_runner(num_steps_per_env=2)
+    obs = runner.env.get_observations()
+
+    def fake_sample_actions_from_normalized(self, normalized_obs: torch.Tensor):
+        anchor = next(self.parameters()).sum() * 0.0
+        action = anchor + torch.tensor([[2.5, -2.5]], dtype=torch.float32).expand(normalized_obs.shape[0], -1).clone()
+        return (
+            action,
+            anchor + torch.zeros(normalized_obs.shape[0]),
+            anchor + torch.zeros(normalized_obs.shape[0]),
+            anchor + torch.full((normalized_obs.shape[0],), 2.0),
+            action,
+            anchor + torch.tensor(1.0),
+            anchor + torch.tensor(1.0),
+        )
+
+    recorded_log_prob_actions: list[torch.Tensor] = []
+
+    class FakeDist:
+        def sample(self, sample_shape: tuple[int, ...] = torch.Size()) -> torch.Tensor:
+            if sample_shape:
+                return torch.tensor(
+                    [
+                        [[[3.0, -3.0]], [[4.0, -4.0]]],
+                    ],
+                    dtype=torch.float32,
+                )
+            return torch.tensor(
+                [
+                    [[5.0, -5.0]],
+                    [[6.0, -6.0]],
+                ],
+                dtype=torch.float32,
+            )
+
+        def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+            recorded_log_prob_actions.append(actions.clone())
+            return torch.zeros(actions.shape[:-1], dtype=torch.float32)
+
+    def fake_build_distribution_from_normalized(self, normalized_obs: torch.Tensor):
+        return FakeDist()
+
+    def fake_forward_normalized(self, obs: torch.Tensor, action: torch.Tensor):
+        value_shape = action.shape[:-1]
+        anchor = next(self.parameters()).sum() * 0.0
+        values = anchor + torch.ones(value_shape, dtype=torch.float32)
+        logits = anchor + torch.zeros(*value_shape, self.num_atoms, dtype=torch.float32)
+        pred = anchor + torch.ones(*value_shape, 8, dtype=torch.float32)
+        embeddings = anchor + torch.ones(*value_shape, 8, dtype=torch.float32)
+        return values, logits, pred, embeddings
+
+    runner.policy.sample_actions_from_normalized = types.MethodType(fake_sample_actions_from_normalized, runner.policy)
+    runner.policy.build_distribution_from_normalized = types.MethodType(
+        fake_build_distribution_from_normalized, runner.policy
+    )
+    runner.critic.forward_normalized = types.MethodType(fake_forward_normalized, runner.critic)
+
+    first_obs = obs
+    second_obs = TensorDict(
+        {
+            "policy": torch.tensor([[5.0, 6.0]], dtype=torch.float32),
+            "critic": torch.tensor([[7.0, 8.0]], dtype=torch.float32),
+        },
+        batch_size=[1],
+    )
+    third_obs = TensorDict(
+        {
+            "policy": torch.tensor([[9.0, 10.0]], dtype=torch.float32),
+            "critic": torch.tensor([[11.0, 12.0]], dtype=torch.float32),
+        },
+        batch_size=[1],
+    )
+
+    runner.act(first_obs)
+    runner.process_env_step(second_obs, rewards=torch.tensor([1.0]), dones=torch.tensor([0.0]), extras={})
+    runner.act(second_obs)
+    runner.process_env_step(third_obs, rewards=torch.tensor([1.0]), dones=torch.tensor([0.0]), extras={})
+
+    runner.compute_returns(third_obs)
+    runner.update()
+
+    assert recorded_log_prob_actions
+    assert all(action.abs().max().item() <= 1.0 for action in recorded_log_prob_actions)
+
+
+def test_reppo_runner_load_resumes_from_next_iteration() -> None:
+    runner = _make_runner()
+    runner.current_learning_iteration = 7
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        checkpoint_path = os.path.join(tmpdir, "model_7.pt")
+        runner.save(checkpoint_path)
+
+        resumed_runner = _make_runner()
+        resumed_runner.load(checkpoint_path)
+
+    assert resumed_runner.current_learning_iteration == 8
+
+
+def test_reppo_runner_load_can_reset_global_std_to_init() -> None:
+    runner = _make_runner(
+        policy_overrides={
+            "state_dependent_std": False,
+            "reset_global_std_on_resume": True,
+            "init_noise_std": 1.0,
+            "actor_min_std": 0.1,
+        }
+    )
+    output_layer = runner.policy._get_actor_output_layer()
+
+    with torch.no_grad():
+        output_layer.bias[runner.policy.num_actions :].fill_(torch.log(torch.tensor(0.2)))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        checkpoint_path = os.path.join(tmpdir, "model_1.pt")
+        runner.save(checkpoint_path)
+
+        resumed_runner = _make_runner(
+            policy_overrides={
+                "state_dependent_std": False,
+                "reset_global_std_on_resume": True,
+                "init_noise_std": 1.0,
+                "actor_min_std": 0.1,
+            }
+        )
+        resumed_runner.load(checkpoint_path)
+
+    assert torch.allclose(resumed_runner.policy.output_std, torch.ones(2), atol=1e-6)
+    assert torch.allclose(resumed_runner.policy_old.output_std, torch.ones(2), atol=1e-6)
+
+
+def test_reppo_soft_bonus_matches_dt_scaled_rewards() -> None:
+    runner = _make_runner(num_steps_per_env=1)
+    runner.env.cfg["scale_rewards_by_dt"] = True
+    runner.reward_scale = runner._resolve_reward_scale()
+
+    data = {
+        "next_observations": torch.zeros(1, 1, 2),
+        "next_critic_observations": torch.zeros(1, 1, 2),
+        "rewards": torch.zeros(1, 1, 1),
+        "actions": torch.zeros(1, 1, 2),
+        "truncations": torch.ones(1, 1, 1),
+    }
+
+    class FakeDist:
+        def sample(self, sample_shape: tuple[int, ...] = torch.Size()) -> torch.Tensor:
+            return torch.full((1, 1, 2), 0.25, dtype=torch.float32)
+
+        def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+            return torch.full(actions.shape, -10.0, dtype=torch.float32)
+
+    def fake_build_distribution_from_normalized(self, normalized_obs: torch.Tensor):
+        return FakeDist()
+
+    def fake_forward_normalized(self, obs: torch.Tensor, action: torch.Tensor):
+        value_shape = action.shape[:-1]
+        anchor = next(self.parameters()).sum() * 0.0
+        values = anchor + torch.ones(value_shape, dtype=torch.float32)
+        logits = anchor + torch.zeros(*value_shape, self.num_atoms, dtype=torch.float32)
+        pred = anchor + torch.ones(*value_shape, 8, dtype=torch.float32)
+        embeddings = anchor + torch.ones(*value_shape, 8, dtype=torch.float32)
+        return values, logits, pred, embeddings
+
+    runner.policy.build_distribution_from_normalized = types.MethodType(
+        fake_build_distribution_from_normalized, runner.policy
+    )
+    runner.critic.forward_normalized = types.MethodType(fake_forward_normalized, runner.critic)
+    with torch.no_grad():
+        runner.policy.log_temp.fill_(0.0)
+
+    extras = runner._compute_rollout_extras(data)
+
+    expected_bonus = 0.99 * 20.0 * 0.02
+    assert torch.allclose(extras["soft_bonus"], torch.full((1, 1, 1), expected_bonus), atol=1e-6)
+    assert torch.allclose(extras["rewards"], torch.full((1, 1, 1), expected_bonus), atol=1e-6)

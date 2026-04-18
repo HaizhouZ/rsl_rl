@@ -5,35 +5,13 @@
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
 from torch.distributions import Normal, TransformedDistribution
-from torch.distributions.transforms import Transform
 
 from rsl_rl.modules import EmpiricalNormalization
-
-
-class TanhTransform(Transform):
-    """Numerically stable tanh transform."""
-
-    domain = torch.distributions.constraints.real
-    codomain = torch.distributions.constraints.interval(-1.0, 1.0)
-    bijective = True
-    sign = +1
-    log2 = torch.log(torch.tensor(2.0))
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, TanhTransform)
-
-    def _call(self, x: torch.Tensor) -> torch.Tensor:
-        return x.tanh()
-
-    def _inverse(self, y: torch.Tensor) -> torch.Tensor:
-        return torch.atanh(y)
-
-    def log_abs_det_jacobian(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return 2.0 * (self.log2 - x - torch.nn.functional.softplus(-2.0 * x))
 
 
 def hl_gauss(inp: torch.Tensor, vmin: float, vmax: float, num_atoms: int) -> torch.Tensor:
@@ -193,6 +171,8 @@ class ReppoPolicy(nn.Module):
         activation: str = "swish",
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
+        state_dependent_std: bool = True,
+        reset_global_std_on_resume: bool = False,
         actor_min_std: float = 0.0,
         ent_start: float = 0.01,
         kl_start: float = 0.01,
@@ -214,6 +194,8 @@ class ReppoPolicy(nn.Module):
 
         self.actor_obs_dim = self._get_obs_dim(obs, self.actor_obs_groups)
         self.critic_obs_dim = self._get_obs_dim(obs, self.critic_obs_groups)
+        self.state_dependent_std = state_dependent_std
+        self.reset_global_std_on_resume = reset_global_std_on_resume
 
         self.actor_obs_normalization = actor_obs_normalization
         if actor_obs_normalization:
@@ -252,7 +234,7 @@ class ReppoPolicy(nn.Module):
 
         Normal.set_default_validate_args(False)
 
-    def _initialize_actor_std_head(self, num_actions: int, init_noise_std: float, actor_min_std: float) -> None:
+    def _get_actor_output_layer(self) -> nn.Linear:
         last_linear = None
         for module in reversed(self.actor_model.net):  # type: ignore[attr-defined]
             if isinstance(module, nn.Linear):
@@ -260,12 +242,33 @@ class ReppoPolicy(nn.Module):
                 break
         if last_linear is None:
             raise RuntimeError("REPPO actor model does not contain a terminal linear layer.")
+        return last_linear
 
+    def _initialize_actor_std_head(self, num_actions: int, init_noise_std: float, actor_min_std: float) -> None:
+        last_linear = self._get_actor_output_layer()
         target_std = max(init_noise_std - actor_min_std, 1e-6)
         target_log_std = torch.log(torch.tensor(target_std, dtype=last_linear.weight.dtype))
         with torch.no_grad():
             last_linear.weight[num_actions:].zero_()
             last_linear.bias[num_actions:].fill_(target_log_std.item())
+
+    def _compute_std(self, mean: torch.Tensor, log_std: torch.Tensor) -> torch.Tensor:
+        if self.state_dependent_std:
+            return torch.exp(log_std) + self.actor_min_std
+
+        output_layer = self._get_actor_output_layer()
+        global_log_std = output_layer.bias[self.num_actions :].view(1, -1).expand_as(mean)
+        return torch.exp(global_log_std) + self.actor_min_std
+
+    def reset_std_to_init(self) -> None:
+        self._initialize_actor_std_head(self.num_actions, self.init_noise_std, self.actor_min_std)
+        self._cached_output_std.copy_(torch.full_like(self._cached_output_std, self.init_noise_std))
+
+    def get_global_std_bias_parameter(self) -> tuple[nn.Parameter, slice] | None:
+        if self.state_dependent_std:
+            return None
+        output_layer = self._get_actor_output_layer()
+        return output_layer.bias, slice(self.num_actions, None)
 
     def _get_obs_dim(self, obs: TensorDict, obs_groups: list[str]) -> int:
         obs_dim = 0
@@ -305,46 +308,46 @@ class ReppoPolicy(nn.Module):
 
     def _distribution_from_normalized(
         self, normalized_obs: torch.Tensor
-    ) -> tuple[TransformedDistribution, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[TransformedDistribution, Normal, torch.Tensor, torch.Tensor, torch.Tensor]:
         out = self.actor_model(normalized_obs)
         mean, log_std = torch.split(out, out.shape[-1] // 2, dim=-1)
-        std = torch.exp(log_std) + self.actor_min_std
+        std = self._compute_std(mean, log_std)
         self._cached_output_std.copy_(std.reshape(-1, std.shape[-1]).mean(dim=0).detach())
-        dist = TransformedDistribution(Normal(mean, std), [TanhTransform(cache_size=1)])
-        return dist, torch.tanh(mean), torch.exp(self.log_temp), torch.exp(self.log_lagrange)
+        base_dist = Normal(mean, std)
+        dist = TransformedDistribution(base_dist, [torch.distributions.TanhTransform()])
+        return dist, base_dist, torch.tanh(mean), torch.exp(self.log_temp), torch.exp(self.log_lagrange)
 
     def build_distribution(self, obs: TensorDict | torch.Tensor) -> TransformedDistribution:
-        dist, _, _, _ = self._distribution_from_normalized(self.normalize_actor_obs(obs))
+        dist, _, _, _, _ = self._distribution_from_normalized(self.normalize_actor_obs(obs))
         return dist
 
     def build_distribution_from_normalized(self, normalized_obs: torch.Tensor) -> TransformedDistribution:
-        dist, _, _, _ = self._distribution_from_normalized(normalized_obs)
+        dist, _, _, _, _ = self._distribution_from_normalized(normalized_obs)
         return dist
 
     def sample_actions(
         self, obs: TensorDict | torch.Tensor, normalized: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         actor_obs = obs if normalized else self.normalize_actor_obs(obs)
-        dist, deterministic_actions, _, _ = self._distribution_from_normalized(actor_obs)
+        dist, _, deterministic_actions, _, _ = self._distribution_from_normalized(actor_obs)
         actions = dist.rsample()
-        clipped_actions = actions.clamp(-1 + 1e-6, 1 - 1e-6)
-        log_prob = dist.log_prob(clipped_actions).sum(dim=-1)
+        log_prob = dist.log_prob(actions.clip(-1 + 1e-6, 1 - 1e-6)).sum(dim=-1)
         entropy = -log_prob
         return actions, log_prob, entropy, deterministic_actions
 
     def sample_actions_from_normalized(
         self, normalized_obs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        dist, deterministic_actions, temperature, beta = self._distribution_from_normalized(normalized_obs)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        dist, base_dist, deterministic_actions, temperature, beta = self._distribution_from_normalized(normalized_obs)
         actions = dist.rsample()
-        clipped_actions = actions.clamp(-1 + 1e-6, 1 - 1e-6)
-        log_prob = dist.log_prob(clipped_actions).sum(dim=-1)
-        entropy = -log_prob
-        return actions, log_prob, entropy, deterministic_actions, temperature, beta
+        log_prob = dist.log_prob(actions.clip(-1 + 1e-6, 1 - 1e-6)).sum(dim=-1)
+        policy_entropy = -log_prob
+        base_entropy = base_dist.entropy().sum(dim=-1)
+        return actions, log_prob, policy_entropy, base_entropy, deterministic_actions, temperature, beta
 
     def get_actions_log_prob(self, obs: TensorDict | torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         dist = self.build_distribution(obs)
-        return dist.log_prob(actions).sum(dim=-1)
+        return dist.log_prob(actions.clip(-1 + 1e-6, 1 - 1e-6)).sum(dim=-1)
 
     def forward(self, obs: TensorDict | torch.Tensor) -> torch.Tensor:
         """Deterministic inference path used by play/export utilities."""
@@ -356,6 +359,10 @@ class ReppoPolicy(nn.Module):
     @property
     def output_std(self) -> torch.Tensor:
         return self._cached_output_std.detach().clone()
+
+    @property
+    def unit_gaussian_entropy_per_dim(self) -> float:
+        return 0.5 * (1.0 + math.log(2.0 * math.pi))
 
 
 class ReppoCritic(nn.Module):

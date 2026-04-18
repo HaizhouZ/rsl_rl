@@ -9,6 +9,7 @@ import copy
 import inspect
 import os
 import time
+from contextlib import contextmanager
 from collections.abc import Iterable
 from types import SimpleNamespace
 
@@ -51,8 +52,6 @@ class ReppoRunner:
         self.vmin = algorithm_cfg.get("vmin", 0.0)
         self.vmax = algorithm_cfg.get("vmax", 150.0)
         self.aux_loss_mult = algorithm_cfg.get("aux_loss_mult", 0.0)
-        self.num_action_samples = algorithm_cfg.get("num_action_samples", 64)
-        self.num_action_sample_chunk_size = algorithm_cfg.get("num_action_sample_chunk_size", 1)
         self.kl_bound = algorithm_cfg.get("kl_bound", algorithm_cfg.get("desired_kl", 0.1))
         self.actor_kl_clip_mode = algorithm_cfg.get("actor_kl_clip_mode", "clipped")
         self.ent_target_mult = algorithm_cfg.get("ent_target_mult", 0.5)
@@ -97,6 +96,19 @@ class ReppoRunner:
         self.rollout_data: dict[str, torch.Tensor] | None = None
         self.rollout_metrics: dict[str, float] = {}
         self.alg = SimpleNamespace(policy=self.policy, critic=self.critic)
+        self.reward_scale = self._resolve_reward_scale()
+
+    @contextmanager
+    def _freeze_module_params(self, module: torch.nn.Module):
+        params = tuple(module.parameters())
+        original_requires_grad = [param.requires_grad for param in params]
+        try:
+            for param in params:
+                param.requires_grad_(False)
+            yield
+        finally:
+            for param, requires_grad in zip(params, original_requires_grad, strict=True):
+                param.requires_grad_(requires_grad)
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         if init_at_random_ep_len:
@@ -162,13 +174,13 @@ class ReppoRunner:
         raw_actor_obs = self.policy.get_actor_obs(obs)
         raw_critic_obs = self.critic.get_critic_obs(obs)
         actor_obs = self.policy.normalize_actor_obs(raw_actor_obs)
-        actions, log_prob, entropy, _, _, _ = self.policy.sample_actions_from_normalized(actor_obs)
+        actions, log_prob, policy_entropy, _, _, _, _ = self.policy.sample_actions_from_normalized(actor_obs)
         self.pending_transition = {
             "observations": raw_actor_obs.detach(),
             "critic_observations": raw_critic_obs.detach(),
             "actions": actions.detach(),
             "log_probs": log_prob.detach(),
-            "entropy": entropy.detach(),
+            "entropy": policy_entropy.detach(),
         }
         return actions
 
@@ -261,6 +273,8 @@ class ReppoRunner:
         mean_critic_loss = 0.0
         mean_actor_loss = 0.0
         mean_entropy = 0.0
+        mean_policy_entropy = 0.0
+        mean_base_entropy = 0.0
         mean_kl = 0.0
         mean_embedding_loss = 0.0
         mean_temperature = 0.0
@@ -311,20 +325,22 @@ class ReppoRunner:
                 (
                     new_actions,
                     log_probs,
-                    entropy,
+                    policy_entropy,
+                    base_entropy,
                     _,
                     temperature,
                     beta,
                 ) = self.policy.sample_actions_from_normalized(batch_obs)
-                qf, _, _, _ = self.critic.forward_normalized(batch_critic_obs, new_actions)
+                with self._freeze_module_params(self.critic):
+                    qf, _, _, _ = self.critic.forward_normalized(batch_critic_obs, new_actions)
 
-                with torch.inference_mode():
+                with torch.no_grad():
                     old_dist = old_policy.build_distribution_from_normalized(batch_obs)
-                    new_dist = self.policy.build_distribution_from_normalized(batch_obs)
-                    old_actions = old_dist.sample((16,)).clamp(-1 + 1e-6, 1 - 1e-6)
+                    old_actions = old_dist.sample((16,)).clip(-1 + 1e-6, 1 - 1e-6)
                     old_log_probs = old_dist.log_prob(old_actions).sum(dim=-1).mean(dim=0)
-                    new_log_probs = new_dist.log_prob(old_actions).sum(dim=-1).mean(dim=0)
-                    kl = old_log_probs - new_log_probs
+                new_dist = self.policy.build_distribution_from_normalized(batch_obs)
+                new_log_probs = new_dist.log_prob(old_actions).sum(dim=-1).mean(dim=0)
+                kl = old_log_probs - new_log_probs
 
                 actor_loss = -qf + temperature.detach() * log_probs
 
@@ -338,7 +354,8 @@ class ReppoRunner:
                     raise ValueError(f"Unknown actor_kl_clip_mode: {self.actor_kl_clip_mode}")
 
                 target_entropy = new_actions.shape[-1] * self.ent_target_mult
-                entropy_loss = (target_entropy + entropy).detach().mean() * temperature
+                # Drive the squashed-policy entropy surrogate toward the configured target.
+                entropy_loss = (policy_entropy - target_entropy).detach().mean() * temperature
                 lagrangian_loss = (-beta * (kl - self.kl_bound).mean().detach())
                 actor_loss = (actor_loss + entropy_loss + lagrangian_loss).mean()
 
@@ -353,7 +370,9 @@ class ReppoRunner:
 
                 mean_critic_loss += critic_loss.item()
                 mean_actor_loss += actor_loss.item()
-                mean_entropy += entropy.mean().item()
+                mean_entropy += policy_entropy.mean().item()
+                mean_policy_entropy += policy_entropy.mean().item()
+                mean_base_entropy += base_entropy.mean().item()
                 mean_kl += kl.mean().item()
                 mean_embedding_loss += embedding_loss.item()
                 mean_temperature += temperature.mean().item()
@@ -366,6 +385,8 @@ class ReppoRunner:
         mean_critic_loss /= num_updates
         mean_actor_loss /= num_updates
         mean_entropy /= num_updates
+        mean_policy_entropy /= num_updates
+        mean_base_entropy /= num_updates
         mean_kl /= num_updates
         mean_embedding_loss /= num_updates
         mean_temperature /= num_updates
@@ -385,6 +406,9 @@ class ReppoRunner:
         metric_dict = dict(self.rollout_metrics)
         metric_dict["temperature"] = mean_temperature
         metric_dict["beta"] = mean_beta
+        metric_dict["policy_entropy"] = mean_policy_entropy
+        metric_dict["base_entropy"] = mean_base_entropy
+        metric_dict["target_entropy"] = target_entropy
         self.rollout_metrics = {}
         return loss_dict, metric_dict
 
@@ -430,7 +454,11 @@ class ReppoRunner:
         if load_optimizer:
             self.actor_optimizer.load_state_dict(loaded_dict["actor_optimizer_state_dict"])
             self.critic_optimizer.load_state_dict(loaded_dict["critic_optimizer_state_dict"])
-        self.current_learning_iteration = loaded_dict["iter"]
+        if getattr(self.policy, "reset_global_std_on_resume", False) and not self.policy.state_dependent_std:
+            self.policy.reset_std_to_init()
+            self.policy_old.reset_std_to_init()
+            self._reset_global_std_optimizer_state()
+        self.current_learning_iteration = loaded_dict["iter"] + 1
         if "env_state" in loaded_dict and hasattr(self.env, "unwrapped"):
             env_state = loaded_dict["env_state"] or {}
             if "common_step_counter" in env_state and hasattr(self.env.unwrapped, "common_step_counter"):
@@ -446,6 +474,33 @@ class ReppoRunner:
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
         self.logger.git_status_repos.append(repo_file_path)
+
+    def _reset_global_std_optimizer_state(self) -> None:
+        param_and_slice = self.policy.get_global_std_bias_parameter()
+        if param_and_slice is None:
+            return
+        param, std_slice = param_and_slice
+        state = self.actor_optimizer.state.get(param)
+        if state is None:
+            return
+        for value in state.values():
+            if torch.is_tensor(value) and value.shape == param.shape:
+                value[std_slice].zero_()
+
+    def _resolve_reward_scale(self) -> float:
+        env_cfg = getattr(self.env, "cfg", None)
+        if env_cfg is None:
+            return 1.0
+        scale_rewards_by_dt = getattr(env_cfg, "scale_rewards_by_dt", None)
+        if scale_rewards_by_dt is None and isinstance(env_cfg, dict):
+            scale_rewards_by_dt = env_cfg.get("scale_rewards_by_dt")
+        if not scale_rewards_by_dt:
+            return 1.0
+        unwrapped_env = getattr(self.env, "unwrapped", self.env)
+        step_dt = getattr(unwrapped_env, "step_dt", None)
+        if step_dt is None:
+            return 1.0
+        return float(step_dt)
 
     def broadcast_parameters(self) -> None:
         model_params = [self.policy.state_dict(), self.critic.state_dict()]
@@ -533,41 +588,15 @@ class ReppoRunner:
         next_obs = data["next_observations"]
         next_critic_obs = data["next_critic_observations"]
         rewards = data["rewards"]
-        actions = data["actions"]
-        truncations = data["truncations"]
 
         with torch.inference_mode():
             next_dist = self.policy.build_distribution_from_normalized(next_obs)
-            sampled_next_actions = next_dist.sample()
-            shifted_actions = torch.cat([actions[1:], sampled_next_actions[-1:]], dim=0)
-            true_next_actions = torch.where(
-                truncations.bool().expand_as(sampled_next_actions),
-                sampled_next_actions,
-                shifted_actions,
-            ).clamp(-1 + 1e-6, 1 - 1e-6)
-            next_log_probs = next_dist.log_prob(true_next_actions).sum(dim=-1, keepdim=True)
+            next_actions = next_dist.sample()
+            next_log_probs = next_dist.log_prob(next_actions.clip(-1 + 1e-6, 1 - 1e-6)).sum(dim=-1, keepdim=True)
             temperature = torch.exp(self.policy.log_temp)
-            soft_bonus = -self.gamma * next_log_probs * temperature
+            soft_bonus = -self.gamma * next_log_probs * temperature * self.reward_scale
             soft_rewards = rewards + soft_bonus
-
-            value_sum = None
-            next_embeddings = None
-            remaining_samples = self.num_action_samples
-            while remaining_samples > 0:
-                chunk_size = min(self.num_action_sample_chunk_size, remaining_samples)
-                sampled_value_actions = next_dist.sample(sample_shape=(chunk_size,))
-                expanded_next_critic_obs = next_critic_obs.unsqueeze(0).expand(chunk_size, *next_critic_obs.shape)
-                next_values, _, _, chunk_embeddings = self.critic.forward_normalized(
-                    expanded_next_critic_obs, sampled_value_actions
-                )
-                chunk_value_sum = next_values.sum(dim=0)
-                value_sum = chunk_value_sum if value_sum is None else value_sum + chunk_value_sum
-                if next_embeddings is None:
-                    next_embeddings = chunk_embeddings[0]
-                remaining_samples -= chunk_size
-
-        if value_sum is None or next_embeddings is None:
-            raise RuntimeError("REPPO next-value estimation produced no samples")
+            next_values, _, _, next_embeddings = self.critic.forward_normalized(next_critic_obs, next_actions)
 
         return {
             "raw_rewards": rewards.to(dtype=torch.float32),
@@ -575,7 +604,7 @@ class ReppoRunner:
             "soft_bonus": soft_bonus.to(dtype=torch.float32),
             "next_log_probs": next_log_probs.to(dtype=torch.float32),
             "temperature": torch.full_like(rewards, float(temperature.item()), dtype=torch.float32),
-            "next_values": (value_sum / float(self.num_action_samples)).unsqueeze(-1).to(dtype=torch.float32),
+            "next_values": next_values.unsqueeze(-1).to(dtype=torch.float32),
             "next_embeddings": next_embeddings.to(dtype=torch.float32),
         }
 
