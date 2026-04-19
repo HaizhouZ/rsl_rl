@@ -267,7 +267,7 @@ class REPPO:
             self.policy.alpha_kl.detach() * kl_divergence,
         ).mean()
 
-        temp_target_loss = self.policy.alpha_temp * (entropy.mean() + self.target_entropy).detach()
+        temp_target_loss = self.policy.alpha_temp * (entropy.mean() - self.target_entropy).detach()
         kl_target_loss = self.policy.alpha_kl * (self.desired_kl - kl_divergence.mean()).detach()
 
         self._set_critic_grad(False)
