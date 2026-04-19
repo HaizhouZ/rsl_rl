@@ -8,8 +8,7 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
-from rsl_rl.models import ReppoCritic, ReppoPolicy
-from rsl_rl.models.reppo_model import _ExportableRMSNorm
+from rsl_rl.modules import ActorQ
 
 
 def _make_obs() -> TensorDict:
@@ -22,178 +21,122 @@ def _make_obs() -> TensorDict:
     )
 
 
-def test_reppo_policy_uses_state_dependent_std() -> None:
+def test_actor_q_uses_state_dependent_std() -> None:
     obs = _make_obs()
-    policy = ReppoPolicy(
+    policy = ActorQ(
         obs,
-        {"actor": ["policy"], "critic": ["critic"]},
+        {"policy": ["policy"], "critic": ["critic"]},
         num_actions=2,
         actor_obs_normalization=False,
+        critic_obs_normalization=False,
         actor_hidden_dims=(4,),
-        actor_min_std=0.1,
-        use_actor_norm=False,
+        critic_hidden_dims=(4, 4),
+        state_dependent_std=True,
+        distribution_type="normal",
     )
 
     with torch.no_grad():
-        linear_layers = [module for module in policy.actor_model.modules() if isinstance(module, torch.nn.Linear)]
-        linear_layers[0].weight.copy_(
-            torch.tensor(
-                [
-                    [1.0, 0.0],
-                    [0.0, 1.0],
-                    [1.0, -1.0],
-                    [-1.0, 1.0],
-                ]
-            )
-        )
-        linear_layers[0].bias.zero_()
-        linear_layers[1].weight.copy_(
-            torch.tensor(
-                [
-                    [1.0, 0.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0, 0.0],
-                    [0.0, 0.0, 1.0, 0.0],
-                    [0.0, 0.0, 0.0, 1.0],
-                ]
-            )
-        )
-        linear_layers[1].bias.zero_()
+        actor_layers = [module for module in policy.actor.modules() if isinstance(module, torch.nn.Linear)]
+        first_linear = actor_layers[0]
+        final_linear = actor_layers[-1]
+        first_linear.weight.zero_()
+        first_linear.bias.zero_()
+        first_linear.weight[0, 0] = 1.0
+        first_linear.weight[1, 1] = 1.0
+        final_linear.weight.zero_()
+        final_linear.bias.zero_()
+        final_linear.weight[2, 0] = 1.0
+        final_linear.weight[3, 1] = 1.0
 
-    norm_obs = policy.normalize_actor_obs(obs)
-    dist = policy.build_distribution_from_normalized(norm_obs)
-    std = dist.base_dist.scale
+    normalized_obs = policy.actor_obs_normalizer(policy.get_actor_obs(obs))
+    policy._update_distribution(normalized_obs)
+    std = policy.action_std
 
     assert std.shape == (2, 2)
-    assert not torch.allclose(std[0], std[1]), "REPPO actor std should depend on the observation"
+    assert not torch.allclose(std[0], std[1])
 
 
-def test_reppo_policy_can_use_global_std() -> None:
+def test_actor_q_can_use_global_std() -> None:
     obs = _make_obs()
-    policy = ReppoPolicy(
+    policy = ActorQ(
         obs,
-        {"actor": ["policy"], "critic": ["critic"]},
+        {"policy": ["policy"], "critic": ["critic"]},
         num_actions=2,
         actor_obs_normalization=False,
+        critic_obs_normalization=False,
         actor_hidden_dims=(4,),
-        actor_min_std=0.1,
+        critic_hidden_dims=(4, 4),
         state_dependent_std=False,
-        use_actor_norm=False,
+        distribution_type="normal",
     )
 
-    norm_obs = policy.normalize_actor_obs(obs)
-    dist = policy.build_distribution_from_normalized(norm_obs)
-    std = dist.base_dist.scale
+    normalized_obs = policy.actor_obs_normalizer(policy.get_actor_obs(obs))
+    policy._update_distribution(normalized_obs)
+    std = policy.action_std
 
     assert std.shape == (2, 2)
-    assert torch.allclose(std[0], std[1]), "REPPO global std should not depend on the observation"
+    assert torch.allclose(std[0], std[1])
 
 
-def test_reppo_policy_layer_count_matches_total_layers_semantics() -> None:
+def test_actor_q_inference_is_tanh_squashed() -> None:
     obs = _make_obs()
-    policy = ReppoPolicy(
+    policy = ActorQ(
         obs,
-        {"actor": ["policy"], "critic": ["critic"]},
+        {"policy": ["policy"], "critic": ["critic"]},
         num_actions=2,
         actor_obs_normalization=False,
-        actor_hidden_dims=(),
-        actor_hidden_dim=4,
-        num_actor_layers=3,
-        use_actor_norm=False,
-    )
-
-    linear_layers = [module for module in policy.actor_model.modules() if isinstance(module, torch.nn.Linear)]
-    assert len(linear_layers) == 3
-
-
-def test_reppo_policy_log_noise_std_type_initializes_exp_scale() -> None:
-    obs = _make_obs()
-    policy = ReppoPolicy(
-        obs,
-        {"actor": ["policy"], "critic": ["critic"]},
-        num_actions=2,
-        actor_obs_normalization=False,
+        critic_obs_normalization=False,
         actor_hidden_dims=(4,),
-        init_noise_std=0.0,
-        noise_std_type="log",
-        actor_min_std=0.1,
-        use_actor_norm=False,
-    )
-
-    assert torch.allclose(policy.output_std, torch.ones(2), atol=1e-6)
-
-
-def test_reppo_policy_reports_base_entropy_separately_from_squashed_entropy() -> None:
-    obs = _make_obs()
-    policy = ReppoPolicy(
-        obs,
-        {"actor": ["policy"], "critic": ["critic"]},
-        num_actions=2,
-        actor_obs_normalization=False,
-        actor_hidden_dims=(4,),
-        actor_min_std=0.1,
-        use_actor_norm=False,
-    )
-
-    norm_obs = policy.normalize_actor_obs(obs)
-    _, _, squashed_entropy, base_entropy, _, _, _ = policy.sample_actions_from_normalized(norm_obs)
-
-    assert squashed_entropy.shape == base_entropy.shape == torch.Size([2])
-    assert torch.all(base_entropy > 0.0)
-    assert torch.isfinite(squashed_entropy).all()
-
-
-def test_reppo_policy_inference_is_tanh_squashed() -> None:
-    obs = _make_obs()
-    policy = ReppoPolicy(
-        obs,
-        {"actor": ["policy"], "critic": ["critic"]},
-        num_actions=2,
-        actor_obs_normalization=False,
-        actor_hidden_dims=(),
-        actor_hidden_dim=4,
-        num_actor_layers=1,
-        use_actor_norm=False,
+        critic_hidden_dims=(4, 4),
+        distribution_type="tanh",
+        state_dependent_std=False,
     )
 
     with torch.no_grad():
-        linear_layers = [module for module in policy.actor_model.modules() if isinstance(module, torch.nn.Linear)]
-        linear_layers[0].weight.zero_()
-        linear_layers[0].bias.copy_(torch.tensor([2.0, -2.0, 0.0, 0.0]))
+        actor_layers = [module for module in policy.actor.modules() if isinstance(module, torch.nn.Linear)]
+        actor_layers[0].weight.zero_()
+        actor_layers[0].bias.zero_()
+        actor_layers[1].weight.zero_()
+        actor_layers[1].bias.copy_(torch.tensor([2.0, -2.0]))
 
     actions = policy.act_inference(obs)
     assert torch.allclose(actions[0], torch.tanh(torch.tensor([2.0, -2.0])), atol=1e-6)
 
 
-def test_reppo_policy_get_actions_log_prob_clips_boundary_actions() -> None:
+def test_actor_q_returns_distributional_value_logits() -> None:
     obs = _make_obs()
-    policy = ReppoPolicy(
+    policy = ActorQ(
         obs,
-        {"actor": ["policy"], "critic": ["critic"]},
+        {"policy": ["policy"], "critic": ["critic"]},
         num_actions=2,
         actor_obs_normalization=False,
-        actor_hidden_dims=(4,),
-        use_actor_norm=False,
-    )
-
-    actions = torch.tensor([[1.0, -1.0], [0.25, -0.25]], dtype=torch.float32)
-    log_prob = policy.get_actions_log_prob(obs, actions)
-
-    assert log_prob.shape == torch.Size([2])
-    assert torch.isfinite(log_prob).all()
-
-
-def test_reppo_critic_uses_encoder_output_norm_when_enabled() -> None:
-    obs = _make_obs()
-    critic = ReppoCritic(
-        obs,
-        {"critic": ["critic"]},
-        num_actions=2,
         critic_obs_normalization=False,
-        critic_hidden_dims=(),
-        critic_hidden_dim=4,
-        num_critic_encoder_layers=2,
-        use_critic_norm=True,
-        use_encoder_norm=True,
+        actor_hidden_dims=(4,),
+        critic_hidden_dims=(4, 4),
+        num_critic_bins=51,
     )
 
-    assert isinstance(critic.feature_module.net[-1], _ExportableRMSNorm)
+    actions = torch.zeros(2, 2)
+    values, logits = policy.evaluate(obs, actions, return_logits=True)
+
+    assert values.shape == (2,)
+    assert logits.shape == (2, 51)
+
+
+def test_actor_q_hlgauss_embed_matches_num_bins() -> None:
+    obs = _make_obs()
+    policy = ActorQ(
+        obs,
+        {"policy": ["policy"], "critic": ["critic"]},
+        num_actions=2,
+        actor_obs_normalization=False,
+        critic_obs_normalization=False,
+        actor_hidden_dims=(4,),
+        critic_hidden_dims=(4, 4),
+        num_critic_bins=21,
+    )
+
+    embedded = policy.hlgauss_embed(torch.tensor([0.0, 1.0], dtype=torch.float32))
+
+    assert embedded.shape == (2, 21)
+    assert torch.allclose(embedded.sum(dim=-1), torch.ones(2), atol=1e-5)

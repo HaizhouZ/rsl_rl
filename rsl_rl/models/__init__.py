@@ -7,7 +7,6 @@
 
 from .cnn_model import CNNModel
 from .fast_td3_model import FastTD3Actor, FastTD3Critic
-from .reppo_model import ReppoCritic, ReppoPolicy
 from .mlp_model import MLPModel
 from .rnn_model import RNNModel
 
@@ -16,7 +15,5 @@ __all__ = [
     "FastTD3Actor",
     "FastTD3Critic",
     "MLPModel",
-    "ReppoCritic",
-    "ReppoPolicy",
     "RNNModel",
 ]

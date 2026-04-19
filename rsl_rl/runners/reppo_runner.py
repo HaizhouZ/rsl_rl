@@ -8,7 +8,6 @@ from __future__ import annotations
 import copy
 import os
 import time
-import warnings
 
 import torch
 from tensordict import TensorDict
@@ -23,14 +22,14 @@ from rsl_rl.utils.logger import Logger
 
 
 class ReppoRunner:
-    """Official-style REPPO runner with compatibility translation for legacy local configs."""
+    """Official-style REPPO runner."""
 
     alg: REPPO
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
         self.env = env
         self.device = device
-        self.cfg = self._translate_train_cfg(copy.deepcopy(train_cfg))
+        self.cfg = copy.deepcopy(train_cfg)
         self.policy_cfg = self.cfg["policy"]
         self.alg_cfg = self.cfg["algorithm"]
 
@@ -178,148 +177,19 @@ class ReppoRunner:
         self.logger.git_status_repos.append(repo_file_path)
 
     def _construct_algorithm(self, obs: TensorDict) -> REPPO:
-        policy = ActorQ(obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg).to(self.device)
+        policy_cfg = {key: value for key, value in self.policy_cfg.items() if key != "class_name"}
+        alg_cfg = {key: value for key, value in self.alg_cfg.items() if key != "class_name"}
+        policy = ActorQ(obs, self.cfg["obs_groups"], self.env.num_actions, **policy_cfg).to(self.device)
         storage = ReppoRolloutStorage(
             "rl", self.env.num_envs, self.cfg["num_steps_per_env"], obs, [self.env.num_actions], self.device
         )
-        return REPPO(policy, storage, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
+        return REPPO(policy, storage, device=self.device, **alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
 
     def _get_default_obs_sets(self) -> list[str]:
         default_sets = ["policy", "critic"]
         if self.alg_cfg.get("rnd_cfg") is not None:
             default_sets.append("rnd_state")
         return default_sets
-
-    @staticmethod
-    def _translate_train_cfg(train_cfg: dict) -> dict:
-        cfg = copy.deepcopy(train_cfg)
-        cfg["obs_groups"] = ReppoRunner._translate_obs_groups(cfg.get("obs_groups", {}))
-
-        policy_cfg = dict(cfg.get("policy", {}))
-        algorithm_cfg = dict(cfg.get("algorithm", {}))
-
-        actor_hidden_dims = ReppoRunner._resolve_actor_hidden_dims(policy_cfg)
-        critic_hidden_dims = ReppoRunner._resolve_critic_hidden_dims(policy_cfg)
-
-        translated_policy = {
-            "actor_obs_normalization": policy_cfg.pop("actor_obs_normalization", False),
-            "critic_obs_normalization": policy_cfg.pop("critic_obs_normalization", False),
-            "actor_hidden_dims": actor_hidden_dims,
-            "critic_hidden_dims": critic_hidden_dims,
-            "num_critic_bins": algorithm_cfg.pop("num_atoms", 151),
-            "vmin": algorithm_cfg.pop("vmin", -10.0),
-            "vmax": algorithm_cfg.pop("vmax", 10.0),
-            "activation": policy_cfg.pop("activation", "elu"),
-            "init_noise_std": policy_cfg.pop("init_noise_std", 1.0),
-            "noise_std_type": policy_cfg.pop("noise_std_type", "scalar"),
-            "state_dependent_std": policy_cfg.pop("state_dependent_std", True),
-            "distribution_type": policy_cfg.pop("distribution_type", "tanh"),
-            "init_alpha_temp": policy_cfg.pop("ent_start", 0.001),
-            "init_alpha_kl": policy_cfg.pop("kl_start", 0.01),
-            "action_lower_bound": policy_cfg.pop("action_lower_bound", -1.0),
-            "action_upper_bound": policy_cfg.pop("action_upper_bound", 1.0),
-        }
-
-        policy_cfg.pop("class_name", None)
-        policy_cfg.pop("critic_class_name", None)
-        ignored_policy = {
-            key: policy_cfg.pop(key)
-            for key in list(policy_cfg)
-            if key
-            in {
-                "actor_min_std",
-                "reset_global_std_on_resume",
-                "use_actor_norm",
-                "use_critic_norm",
-                "use_encoder_norm",
-                "num_critic_pred_layers",
-            }
-        }
-        ReppoRunner._warn_ignored_fields("policy", ignored_policy)
-        ReppoRunner._warn_ignored_fields("policy", policy_cfg)
-
-        target_entropy = algorithm_cfg.pop("target_entropy", None)
-        if target_entropy is None:
-            target_entropy = -abs(float(algorithm_cfg.pop("ent_target_mult", 0.5)))
-        else:
-            target_entropy = float(target_entropy)
-
-        translated_algorithm = {
-            "num_learning_epochs": algorithm_cfg.pop("num_learning_epochs", 4),
-            "num_mini_batches": algorithm_cfg.pop("num_mini_batches", 4),
-            "gamma": algorithm_cfg.pop("gamma", 0.99),
-            "lam": algorithm_cfg.pop("lam", algorithm_cfg.pop("lmbda", 0.95)),
-            "learning_rate": algorithm_cfg.pop("learning_rate", 3e-4),
-            "max_grad_norm": algorithm_cfg.pop("max_grad_norm", 0.5),
-            "desired_kl": algorithm_cfg.pop("kl_bound", algorithm_cfg.pop("desired_kl", 0.01)),
-            "target_entropy": target_entropy,
-            "rnd_cfg": algorithm_cfg.pop("rnd_cfg", None),
-            "symmetry_cfg": algorithm_cfg.pop("symmetry_cfg", None),
-            "scale_actions": algorithm_cfg.pop("scale_actions", False),
-            "action_lower_bound": translated_policy["action_lower_bound"],
-            "action_upper_bound": translated_policy["action_upper_bound"],
-        }
-
-        algorithm_cfg.pop("class_name", None)
-        ignored_algorithm = {
-            key: algorithm_cfg.pop(key)
-            for key in list(algorithm_cfg)
-            if key
-            in {
-                "aux_loss_mult",
-                "actor_kl_clip_mode",
-                "schedule",
-                "optimizer",
-                "entropy_coef",
-                "value_loss_coef",
-                "use_clipped_value_loss",
-                "clip_param",
-                "normalize_advantage_per_mini_batch",
-            }
-        }
-        ReppoRunner._warn_ignored_fields("algorithm", ignored_algorithm)
-        ReppoRunner._warn_ignored_fields("algorithm", algorithm_cfg)
-
-        cfg["policy"] = translated_policy
-        cfg["algorithm"] = translated_algorithm
-        return cfg
-
-    @staticmethod
-    def _translate_obs_groups(obs_groups: dict[str, list[str] | tuple[str, ...]]) -> dict[str, list[str] | tuple[str, ...]]:
-        translated = copy.deepcopy(obs_groups)
-        if "policy" not in translated and "actor" in translated:
-            translated["policy"] = translated.pop("actor")
-        return translated
-
-    @staticmethod
-    def _resolve_actor_hidden_dims(policy_cfg: dict) -> tuple[int, ...]:
-        actor_hidden_dims = tuple(policy_cfg.pop("actor_hidden_dims", ()))
-        actor_hidden_dim = int(policy_cfg.pop("actor_hidden_dim", 512))
-        num_actor_layers = int(policy_cfg.pop("num_actor_layers", 3))
-        if actor_hidden_dims:
-            return actor_hidden_dims
-        return tuple(actor_hidden_dim for _ in range(max(num_actor_layers - 1, 1)))
-
-    @staticmethod
-    def _resolve_critic_hidden_dims(policy_cfg: dict) -> tuple[int, ...]:
-        critic_hidden_dims = tuple(policy_cfg.pop("critic_hidden_dims", ()))
-        critic_hidden_dim = int(policy_cfg.pop("critic_hidden_dim", 512))
-        num_critic_encoder_layers = int(policy_cfg.pop("num_critic_encoder_layers", 2))
-        num_critic_head_layers = int(policy_cfg.pop("num_critic_head_layers", 2))
-        total_hidden_layers = max(num_critic_encoder_layers + num_critic_head_layers - 1, 1)
-        if critic_hidden_dims:
-            if len(critic_hidden_dims) == 1:
-                return (critic_hidden_dims[0], critic_hidden_dims[0])
-            return critic_hidden_dims
-        return tuple(critic_hidden_dim for _ in range(total_hidden_layers))
-
-    @staticmethod
-    def _warn_ignored_fields(scope: str, ignored_cfg: dict) -> None:
-        if ignored_cfg:
-            warnings.warn(
-                f"REPPO {scope} options are ignored by the official ActorQ/REPPO port: {sorted(ignored_cfg)}",
-                stacklevel=3,
-            )
 
     def _configure_multi_gpu(self) -> None:
         self.gpu_world_size = int(os.getenv("WORLD_SIZE", "1"))

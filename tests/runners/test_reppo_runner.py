@@ -53,31 +53,30 @@ def _make_runner() -> ReppoRunner:
         {
             "num_steps_per_env": 2,
             "save_interval": 100,
-            "obs_groups": {"actor": ["policy"], "critic": ["critic"]},
+            "obs_groups": {"policy": ["policy"], "critic": ["critic"]},
             "policy": {
-                "class_name": "ReppoPolicy",
-                "critic_class_name": "ReppoCritic",
+                "class_name": "ActorQ",
                 "actor_obs_normalization": False,
                 "critic_obs_normalization": False,
+                "num_critic_bins": 151,
+                "vmin": -10.0,
+                "vmax": 30.0,
                 "actor_hidden_dims": (16, 8),
                 "critic_hidden_dims": (16, 8),
-                "ent_start": 0.001,
-                "kl_start": 0.01,
+                "init_alpha_temp": 0.001,
+                "init_alpha_kl": 0.01,
                 "state_dependent_std": False,
                 "noise_std_type": "scalar",
             },
             "algorithm": {
-                "class_name": "Reppo",
+                "class_name": "REPPO",
                 "num_learning_epochs": 1,
                 "num_mini_batches": 1,
                 "learning_rate": 3e-4,
                 "gamma": 0.99,
                 "lam": 0.95,
-                "num_atoms": 151,
-                "vmin": -10.0,
-                "vmax": 30.0,
-                "kl_bound": 0.1,
-                "ent_target_mult": 0.5,
+                "desired_kl": 0.1,
+                "target_entropy": -0.5,
             },
         },
         log_dir=None,
@@ -85,7 +84,7 @@ def _make_runner() -> ReppoRunner:
     )
 
 
-def test_reppo_runner_translates_legacy_config_to_official_actor_q() -> None:
+def test_reppo_runner_builds_official_actor_q_and_reppo() -> None:
     runner = _make_runner()
 
     assert isinstance(runner.alg.policy, ActorQ)
@@ -128,17 +127,16 @@ def test_reppo_runner_initializes_distributed_process_group() -> None:
     cfg = {
         "num_steps_per_env": 2,
         "save_interval": 100,
-        "obs_groups": {"actor": ["policy"], "critic": ["critic"]},
+        "obs_groups": {"policy": ["policy"], "critic": ["critic"]},
         "policy": {
-            "class_name": "ReppoPolicy",
-            "critic_class_name": "ReppoCritic",
-            "actor_hidden_dims": (8,),
-            "critic_hidden_dims": (8,),
+            "class_name": "ActorQ",
+            "actor_hidden_dims": (8, 8),
+            "critic_hidden_dims": (8, 8),
             "actor_obs_normalization": False,
             "critic_obs_normalization": False,
         },
         "algorithm": {
-            "class_name": "Reppo",
+            "class_name": "REPPO",
             "num_learning_epochs": 1,
             "num_mini_batches": 1,
         },

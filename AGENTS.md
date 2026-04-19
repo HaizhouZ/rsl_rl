@@ -12,8 +12,8 @@ If a change is only needed because of `mjlab2` integration, implement the adapte
 ## Current Boundary
 
 The current public additions are:
-- `rsl_rl.models.ReppoPolicy`
-- `rsl_rl.models.ReppoCritic`
+- `rsl_rl.modules.ActorQ`
+- `rsl_rl.algorithms.REPPO`
 - `rsl_rl.runners.ReppoRunner`
 
 The existing `OnPolicyRunner`, PPO path, logger behavior, and checkpoint format should not be broadened for `mjlab2` convenience unless there is a direct `rsl_rl` requirement.
