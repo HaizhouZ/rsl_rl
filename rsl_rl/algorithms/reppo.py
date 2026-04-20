@@ -13,10 +13,11 @@ import torch.nn as nn
 import torch.optim as optim
 from tensordict import TensorDict
 
-from rsl_rl.extensions import RandomNetworkDistillation
+from rsl_rl.env import VecEnv
+from rsl_rl.extensions import RandomNetworkDistillation, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.modules import ActorQ
 from rsl_rl.storage.reppo_rollout_storage import ReppoRolloutStorage
-from rsl_rl.utils import resolve_callable
+from rsl_rl.utils import resolve_callable, resolve_obs_groups
 
 
 class REPPO:
@@ -90,7 +91,10 @@ class REPPO:
         self.lam = lam
         self.max_grad_norm = max_grad_norm
         self.desired_kl = desired_kl
-        self.target_entropy = target_entropy * self.policy.num_actions
+        # REPPO optimizes positive entropy, while SAC-style configs often provide
+        # a negative per-action target. Treat the sign as convention and use the
+        # magnitude to avoid driving alpha_temp toward zero for negative targets.
+        self.target_entropy = abs(target_entropy) * self.policy.num_actions
         self.learning_rate = learning_rate
 
     def act(self, obs: TensorDict) -> torch.Tensor:
@@ -111,16 +115,21 @@ class REPPO:
         if self.rnd:
             self.rnd.update_normalization(obs)
 
+        time_outs = extras.get("time_outs", torch.zeros_like(dones, dtype=torch.bool)).to(self.device)
+        time_outs_bool = time_outs.bool()
+        time_outs_float = time_outs.float()
+        dones_bool = dones.bool()
+
         self.transition.rewards = rewards.clone()
-        self.transition.dones = dones & ~extras.get("time_outs", torch.zeros_like(dones, dtype=torch.bool)).to(self.device)
-        self.transition.truncations = extras.get("time_outs", torch.zeros_like(dones, dtype=torch.bool)).to(self.device) * 1.0
+        self.transition.dones = dones_bool & ~time_outs_bool
+        self.transition.truncations = time_outs_float
 
         if self.rnd:
             self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
             self.transition.rewards += self.intrinsic_rewards
 
         if "time_outs" in extras:
-            self.transition.rewards += self.gamma * self.transition.values * extras["time_outs"].to(self.device)
+            self.transition.rewards += self.gamma * self.transition.values * time_outs_float
 
         self.transition.soft_rewards = (
             self.transition.rewards - self.gamma * self.policy.alpha_temp * self.transition.actions_log_prob
@@ -128,7 +137,7 @@ class REPPO:
 
         self.storage.add_transition(self.transition)
         self.transition.clear()
-        self.policy.reset(dones)
+        self.policy.reset(dones_bool)
 
     def compute_returns(self, obs: TensorDict) -> None:
         st = self.storage
@@ -179,6 +188,7 @@ class REPPO:
                     "old_std": old_std_batch,
                 }
             )
+            mean_value_loss += critic_metrics["value_loss"]
 
         for (
             obs_batch,
@@ -205,7 +215,6 @@ class REPPO:
                     "old_std": old_std_batch,
                 }
             )
-            mean_value_loss += critic_metrics["value_loss"]
             mean_entropy += actor_metrics["entropy"]
             mean_surrogate_loss += actor_metrics["actor_loss"]
 
@@ -299,9 +308,9 @@ class REPPO:
             obs_batch, actions_batch, hidden_states_batch, masks_batch, return_logits=True
         )
         embedded_returns = self.policy.hlgauss_embed(returns_batch.view(-1)).view(value_logits.shape).detach()
-        value_loss = -(
-            (1.0 - truncations_batch.view(-1)) * (embedded_returns * torch.log_softmax(value_logits, dim=-1)).sum(-1)
-        ).mean()
+        value_loss_per_sample = -(embedded_returns * torch.log_softmax(value_logits, dim=-1)).sum(-1)
+        value_loss_weights = 1.0 - truncations_batch.view(-1).float()
+        value_loss = (value_loss_weights * value_loss_per_sample).sum() / value_loss_weights.sum().clamp_min(1.0)
 
         self.optimizer.zero_grad()
         value_loss.backward()
@@ -354,3 +363,68 @@ class REPPO:
             param.requires_grad = requires_grad
         for param in self.policy.norm.parameters():
             param.requires_grad = requires_grad
+
+    def train_mode(self) -> None:
+        """Set train mode for learnable models."""
+        self.policy.train()
+        if self.rnd:
+            self.rnd.train()
+
+    def eval_mode(self) -> None:
+        """Set evaluation mode for learnable models."""
+        self.policy.eval()
+        if self.rnd:
+            self.rnd.eval()
+
+    def save(self) -> dict:
+        """Return a dict of all models for saving."""
+        saved_dict = {
+            "policy_state_dict": self.policy.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+        }
+        if self.rnd:
+            saved_dict["rnd_state_dict"] = self.rnd.state_dict()
+            saved_dict["rnd_optimizer_state_dict"] = self.rnd_optimizer.state_dict()
+        return saved_dict
+
+    def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
+        """Load specified models from a saved dict."""
+        if load_cfg is None:
+            load_cfg = {
+                "policy": True,
+                "optimizer": True,
+                "iteration": True,
+                "rnd": True,
+            }
+
+        if load_cfg.get("policy"):
+            self.policy.load_state_dict(loaded_dict["policy_state_dict"], strict=strict)
+        if load_cfg.get("optimizer"):
+            self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+        if load_cfg.get("rnd") and self.rnd:
+            self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
+            self.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        return load_cfg.get("iteration", False)
+
+    def get_policy(self) -> ActorQ:
+        """Get the policy model."""
+        return self.policy
+
+    @staticmethod
+    def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> REPPO:
+        """Construct the REPPO algorithm for :class:`OnPolicyRunner`."""
+        alg_class: type[REPPO] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore[assignment]
+        policy_class: type[ActorQ] = resolve_callable(cfg["policy"].pop("class_name"))  # type: ignore[assignment]
+
+        default_sets = ["policy", "critic"]
+        if cfg["algorithm"].get("rnd_cfg") is not None:
+            default_sets.append("rnd_state")
+        cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
+
+        cfg["algorithm"] = resolve_rnd_config(cfg["algorithm"], obs, cfg["obs_groups"], env)
+        cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
+
+        policy = policy_class(obs, cfg["obs_groups"], env.num_actions, **cfg["policy"]).to(device)
+        storage = ReppoRolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+
+        return alg_class(policy, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])

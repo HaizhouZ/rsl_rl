@@ -126,10 +126,45 @@ def _make_train_cfg(model_type: str = "mlp") -> dict:
     return cfg
 
 
+def _make_reppo_train_cfg() -> dict:
+    return {
+        "num_steps_per_env": 4,
+        "save_interval": 100,
+        "obs_groups": {"policy": ["policy"], "critic": ["policy"]},
+        "policy": {
+            "class_name": "ActorQ",
+            "actor_hidden_dims": [32, 32],
+            "critic_hidden_dims": [32, 32],
+            "num_critic_bins": 51,
+            "vmin": -20.0,
+            "vmax": 20.0,
+            "activation": "elu",
+            "distribution_type": "normal",
+            "noise_std_type": "scalar",
+            "state_dependent_std": True,
+        },
+        "algorithm": {
+            "class_name": "REPPO",
+            "num_learning_epochs": 1,
+            "num_mini_batches": 2,
+            "learning_rate": 1.0e-3,
+            "target_entropy": -0.5,
+            "rnd_cfg": None,
+            "symmetry_cfg": None,
+        },
+    }
+
+
 def _build_runner(log_dir: str | None = None, model_type: str = "mlp") -> OnPolicyRunner:
     """Construct a runner with a DummyEnv and minimal config."""
     env = DummyEnv(include_image=(model_type == "cnn"))
     cfg = _make_train_cfg(model_type)
+    return OnPolicyRunner(env, cfg, log_dir=log_dir, device="cpu")
+
+
+def _build_reppo_runner(log_dir: str | None = None) -> OnPolicyRunner:
+    env = DummyEnv()
+    cfg = _make_reppo_train_cfg()
     return OnPolicyRunner(env, cfg, log_dir=log_dir, device="cpu")
 
 
@@ -147,6 +182,12 @@ class TestRunnerConstruction:
         """Initial learning iteration should be zero."""
         runner = _build_runner()
         assert runner.current_learning_iteration == 0
+
+    def test_runner_creates_reppo_algorithm(self) -> None:
+        """Runner should instantiate REPPO through the on-policy construction path."""
+        runner = _build_reppo_runner()
+        assert runner.alg.policy is not None
+        assert runner.alg.target_entropy == 0.5 * NUM_ACTIONS
 
 
 class TestLearnLoop:
@@ -170,6 +211,11 @@ class TestLearnLoop:
         runner = _build_runner()
         runner.learn(num_learning_iterations=3)
         assert runner.current_learning_iteration == 2
+
+    def test_reppo_learn_runs_without_error(self) -> None:
+        """A short REPPO learn call should complete without invalid std errors."""
+        runner = _build_reppo_runner()
+        runner.learn(num_learning_iterations=1)
 
 
 class TestSaveLoad:

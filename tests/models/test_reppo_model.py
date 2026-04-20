@@ -78,6 +78,35 @@ def test_actor_q_can_use_global_std() -> None:
     assert torch.allclose(std[0], std[1])
 
 
+def test_actor_q_scalar_std_is_positive_for_normal_distribution() -> None:
+    obs = _make_obs()
+    policy = ActorQ(
+        obs,
+        {"policy": ["policy"], "critic": ["critic"]},
+        num_actions=2,
+        actor_obs_normalization=False,
+        critic_obs_normalization=False,
+        actor_hidden_dims=(4,),
+        critic_hidden_dims=(4, 4),
+        state_dependent_std=True,
+        distribution_type="normal",
+        noise_std_type="scalar",
+    )
+
+    with torch.no_grad():
+        actor_layers = [module for module in policy.actor.modules() if isinstance(module, torch.nn.Linear)]
+        final_linear = actor_layers[-1]
+        final_linear.weight.zero_()
+        final_linear.bias.zero_()
+        final_linear.bias[2:] = -10.0
+
+    normalized_obs = policy.actor_obs_normalizer(policy.get_actor_obs(obs))
+    policy._update_distribution(normalized_obs)
+
+    assert torch.all(policy.action_std > 0.0)
+    assert policy.act(obs).shape == (2, 2)
+
+
 def test_actor_q_inference_is_tanh_squashed() -> None:
     obs = _make_obs()
     policy = ActorQ(

@@ -41,6 +41,7 @@ class ActorQ(nn.Module):
         init_alpha_kl: float = 0.1,
         action_lower_bound: float = -1.0,
         action_upper_bound: float = 1.0,
+        min_std: float = 1.0e-4,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -113,10 +114,12 @@ class ActorQ(nn.Module):
             self.critic_obs_normalizer = torch.nn.Identity()
 
         self.noise_std_type = noise_std_type
+        self.min_std = min_std
         if self.state_dependent_std:
             torch.nn.init.zeros_(self.actor[-2].weight[num_actions:])
             if self.noise_std_type == "scalar":
-                torch.nn.init.constant_(self.actor[-2].bias[num_actions:], init_noise_std)
+                init_raw_std = torch.log(torch.expm1(torch.tensor(max(init_noise_std - self.min_std, 1.0e-6))))
+                torch.nn.init.constant_(self.actor[-2].bias[num_actions:], init_raw_std)
             elif self.noise_std_type == "log":
                 torch.nn.init.constant_(self.actor[-2].bias[num_actions:], torch.log(torch.tensor(init_noise_std + 1e-7)))
             elif self.noise_std_type == "sigmoid":
@@ -127,7 +130,8 @@ class ActorQ(nn.Module):
                 raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         else:
             if self.noise_std_type == "scalar":
-                self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+                init_raw_std = torch.log(torch.expm1(torch.tensor(max(init_noise_std - self.min_std, 1.0e-6))))
+                self.std = nn.Parameter(init_raw_std * torch.ones(num_actions))
             elif self.noise_std_type == "log":
                 self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
             elif self.noise_std_type == "sigmoid":
@@ -189,7 +193,8 @@ class ActorQ(nn.Module):
             if self.state_dependent_std:
                 mean_and_std = self.actor(obs)
                 if self.noise_std_type == "scalar":
-                    mean, std = torch.unbind(mean_and_std, dim=-2)
+                    mean, raw_std = torch.unbind(mean_and_std, dim=-2)
+                    std = F.softplus(raw_std) + self.min_std
                 elif self.noise_std_type == "log":
                     mean, log_std = torch.unbind(mean_and_std, dim=-2)
                     log_std = torch.clamp(log_std, min=-5.0, max=2.0)
@@ -202,7 +207,7 @@ class ActorQ(nn.Module):
             else:
                 mean = self.actor(obs)
                 if self.noise_std_type == "scalar":
-                    std = self.std.expand_as(mean)
+                    std = (F.softplus(self.std) + self.min_std).expand_as(mean)
                 elif self.noise_std_type == "log":
                     std = torch.exp(self.log_std).expand_as(mean)
                 else:
