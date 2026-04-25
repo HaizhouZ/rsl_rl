@@ -187,7 +187,7 @@ class TestRunnerConstruction:
         """Runner should instantiate REPPO through the on-policy construction path."""
         runner = _build_reppo_runner()
         assert runner.alg.policy is not None
-        assert runner.alg.target_entropy == 0.5 * NUM_ACTIONS
+        assert runner.alg.target_entropy == -0.5 * NUM_ACTIONS
 
 
 class TestLearnLoop:

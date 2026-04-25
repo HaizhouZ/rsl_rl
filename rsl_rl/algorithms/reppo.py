@@ -91,10 +91,7 @@ class REPPO:
         self.lam = lam
         self.max_grad_norm = max_grad_norm
         self.desired_kl = desired_kl
-        # REPPO optimizes positive entropy, while SAC-style configs often provide
-        # a negative per-action target. Treat the sign as convention and use the
-        # magnitude to avoid driving alpha_temp toward zero for negative targets.
-        self.target_entropy = abs(target_entropy) * self.policy.num_actions
+        self.target_entropy = target_entropy * self.policy.num_actions
         self.learning_rate = learning_rate
 
     def act(self, obs: TensorDict) -> torch.Tensor:
