@@ -37,6 +37,12 @@ class REPPO:
         max_grad_norm: float = 1.0,
         desired_kl: float = 0.01,
         target_entropy: float = -1.0,
+        clip_param: float = 0.2,
+        actor_route: str = "reppo",
+        ppo_advantage_normalization: bool = True,
+        cosine_weight_min: float = 0.0,
+        cosine_weight_max: float = 1.0,
+        cosine_weight_power: float = 1.0,
         device: str = "cpu",
         rnd_cfg: dict | None = None,
         symmetry_cfg: dict | None = None,
@@ -93,6 +99,27 @@ class REPPO:
         self.desired_kl = desired_kl
         self.target_entropy = target_entropy * self.policy.num_actions
         self.learning_rate = learning_rate
+        self.clip_param = clip_param
+        self.actor_route = actor_route
+        self.ppo_advantage_normalization = ppo_advantage_normalization
+        self.cosine_weight_min = cosine_weight_min
+        self.cosine_weight_max = cosine_weight_max
+        self.cosine_weight_power = cosine_weight_power
+
+        valid_actor_routes = {"reppo", "hybrid", "ppo_only"}
+        if self.actor_route not in valid_actor_routes:
+            raise ValueError(
+                f"Unsupported REPPO actor_route={self.actor_route!r}. Expected one of {valid_actor_routes}."
+            )
+        if self.clip_param <= 0.0:
+            raise ValueError(f"clip_param must be positive, got {self.clip_param}.")
+        if not 0.0 <= self.cosine_weight_min <= self.cosine_weight_max <= 1.0:
+            raise ValueError(
+                "cosine_weight_min and cosine_weight_max must satisfy "
+                f"0 <= min <= max <= 1, got {self.cosine_weight_min}, {self.cosine_weight_max}."
+            )
+        if self.cosine_weight_power <= 0.0:
+            raise ValueError(f"cosine_weight_power must be positive, got {self.cosine_weight_power}.")
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         if self.policy.is_recurrent:
@@ -153,6 +180,14 @@ class REPPO:
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
+        mean_actor_reppo_loss = 0.0
+        mean_actor_ppo_loss = 0.0
+        mean_reppo_route_weight = 0.0
+        mean_cosine_gq_gppo = 0.0
+        mean_norm_gq = 0.0
+        mean_norm_gppo = 0.0
+        mean_ppo_advantage_abs = 0.0
+        mean_ratio_clip_fraction = 0.0
         mean_rnd_loss = 0 if self.rnd else None
         mean_symmetry_loss = 0 if self.symmetry else None
 
@@ -190,11 +225,11 @@ class REPPO:
         for (
             obs_batch,
             actions_batch,
-            _,
+            values_batch,
             _,
             returns_batch,
             truncations_batch,
-            _,
+            old_actions_log_prob_batch,
             old_mean_batch,
             old_std_batch,
             hidden_states_batch,
@@ -204,8 +239,10 @@ class REPPO:
                 {
                     "obs_batch": obs_batch,
                     "actions_batch": actions_batch,
+                    "values_batch": values_batch,
                     "returns_batch": returns_batch,
                     "truncations_batch": truncations_batch,
+                    "old_actions_log_prob_batch": old_actions_log_prob_batch,
                     "hidden_states_batch": hidden_states_batch,
                     "masks_batch": masks_batch,
                     "old_mean": old_mean_batch,
@@ -214,12 +251,23 @@ class REPPO:
             )
             mean_entropy += actor_metrics["entropy"]
             mean_surrogate_loss += actor_metrics["actor_loss"]
+            mean_actor_reppo_loss += actor_metrics["actor_loss_reppo"]
+            mean_actor_ppo_loss += actor_metrics["actor_loss_ppo"]
+            mean_reppo_route_weight += actor_metrics["reppo_route_weight"]
+            mean_cosine_gq_gppo += actor_metrics["cosine_gQ_gPPO"]
+            mean_norm_gq += actor_metrics["norm_gQ"]
+            mean_norm_gppo += actor_metrics["norm_gPPO"]
+            mean_ppo_advantage_abs += actor_metrics["ppo_advantage_abs_mean"]
+            mean_ratio_clip_fraction += actor_metrics["ratio_clip_fraction"]
 
         print("value prediction error: ", critic_metrics["value_prediction_error"])
         print("enc dec error: ", critic_metrics["enc_dec_error"])
         print("on policy values mean: ", actor_metrics["on_policy_values_mean"])
         print("entropy: ", actor_metrics["entropy"])
         print("kl divergence: ", actor_metrics["kl_divergence"])
+        print("actor route: ", self.actor_route)
+        print("reppo route weight: ", actor_metrics["reppo_route_weight"])
+        print("cosine gQ gPPO: ", actor_metrics["cosine_gQ_gPPO"])
         print("entropy target: ", self.target_entropy)
         print("alpha temp: ", self.policy.alpha_temp.item())
         print("alpha kl: ", self.policy.alpha_kl.item())
@@ -228,6 +276,14 @@ class REPPO:
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_actor_reppo_loss /= num_updates
+        mean_actor_ppo_loss /= num_updates
+        mean_reppo_route_weight /= num_updates
+        mean_cosine_gq_gppo /= num_updates
+        mean_norm_gq /= num_updates
+        mean_norm_gppo /= num_updates
+        mean_ppo_advantage_abs /= num_updates
+        mean_ratio_clip_fraction /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
@@ -238,6 +294,14 @@ class REPPO:
             "value": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            "actor_reppo": mean_actor_reppo_loss,
+            "actor_ppo": mean_actor_ppo_loss,
+            "reppo_route_weight": mean_reppo_route_weight,
+            "cosine_gQ_gPPO": mean_cosine_gq_gppo,
+            "norm_gQ": mean_norm_gq,
+            "norm_gPPO": mean_norm_gppo,
+            "ppo_advantage_abs_mean": mean_ppo_advantage_abs,
+            "ratio_clip_fraction": mean_ratio_clip_fraction,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
@@ -247,6 +311,10 @@ class REPPO:
 
     def update_actor(self, minibatch: dict) -> dict:
         obs_batch = minibatch["obs_batch"]
+        actions_batch = minibatch["actions_batch"]
+        values_batch = minibatch["values_batch"]
+        returns_batch = minibatch["returns_batch"]
+        old_actions_log_prob_batch = minibatch["old_actions_log_prob_batch"]
         hidden_states_batch = minibatch["hidden_states_batch"]
         masks_batch = minibatch["masks_batch"]
 
@@ -258,6 +326,7 @@ class REPPO:
         entropy = -predicted_policy.log_prob(predicted_actions).sum(-1)
         entropy_loss = self.policy.alpha_temp.detach() * entropy
         primary_policy_loss = -(on_policy_values + entropy_loss)
+        pathwise_q_loss = -on_policy_values.mean()
 
         with torch.no_grad():
             self.old_policy.act(obs_batch, hidden_states_batch, masks_batch)
@@ -272,13 +341,37 @@ class REPPO:
             primary_policy_loss,
             self.policy.alpha_kl.detach() * kl_divergence,
         ).mean()
+        reppo_policy_loss = policy_loss
+
+        ppo_policy_loss, ppo_surrogate_loss, ppo_metrics = self._compute_ppo_actor_loss(
+            predicted_policy,
+            entropy,
+            actions_batch,
+            values_batch,
+            returns_batch,
+            old_actions_log_prob_batch,
+        )
+        cosine_gq_gppo = torch.tensor(0.0, device=self.device)
+        norm_gq = torch.tensor(0.0, device=self.device)
+        norm_gppo = torch.tensor(0.0, device=self.device)
+        reppo_route_weight = torch.tensor(1.0, device=self.device)
+        if self.actor_route in {"hybrid", "ppo_only"}:
+            cosine_gq_gppo, norm_gq, norm_gppo = self._actor_loss_cosine(pathwise_q_loss, ppo_surrogate_loss)
+        if self.actor_route == "hybrid":
+            reppo_route_weight = self._cosine_to_reppo_weight(cosine_gq_gppo)
+            policy_loss = reppo_route_weight * policy_loss + (1.0 - reppo_route_weight) * ppo_policy_loss
+        elif self.actor_route == "ppo_only":
+            reppo_route_weight = torch.tensor(0.0, device=self.device)
+            policy_loss = ppo_policy_loss
 
         temp_target_loss = self.policy.alpha_temp * (entropy.mean() - self.target_entropy).detach()
         kl_target_loss = self.policy.alpha_kl * (self.desired_kl - kl_divergence.mean()).detach()
 
         self._set_critic_grad(False)
         self.optimizer.zero_grad()
-        actor_loss = policy_loss + temp_target_loss + kl_target_loss
+        actor_loss = policy_loss + temp_target_loss
+        if self.actor_route != "ppo_only":
+            actor_loss = actor_loss + kl_target_loss
         actor_loss.backward()
         if self.is_multi_gpu:
             self.reduce_parameters()
@@ -288,10 +381,59 @@ class REPPO:
 
         return {
             "actor_loss": actor_loss.item(),
+            "actor_loss_reppo": reppo_policy_loss.item(),
+            "actor_loss_ppo": ppo_policy_loss.item(),
+            "reppo_route_weight": reppo_route_weight.item(),
+            "cosine_gQ_gPPO": cosine_gq_gppo.item(),
+            "norm_gQ": norm_gq.item(),
+            "norm_gPPO": norm_gppo.item(),
+            "ppo_advantage_abs_mean": ppo_metrics["advantage_abs_mean"],
+            "ratio_clip_fraction": ppo_metrics["ratio_clip_fraction"],
             "entropy": entropy.mean().item(),
             "kl_divergence": kl_divergence.mean().item(),
             "on_policy_values_mean": on_policy_values.mean().item(),
         }
+
+    def _compute_ppo_actor_loss(
+        self,
+        predicted_policy: torch.distributions.Distribution,
+        entropy: torch.Tensor,
+        actions_batch: torch.Tensor,
+        values_batch: torch.Tensor,
+        returns_batch: torch.Tensor,
+        old_actions_log_prob_batch: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+        with torch.no_grad():
+            advantages = returns_batch.view(-1) - values_batch.view(-1)
+            advantage_mean = advantages.mean()
+            advantage_std = advantages.std(unbiased=False)
+            advantage_abs_mean = advantages.abs().mean()
+            if self.ppo_advantage_normalization:
+                advantages = (advantages - advantage_mean) / (advantage_std + 1e-8)
+
+        actions_log_prob = predicted_policy.log_prob(actions_batch).sum(-1).view(-1)
+        old_actions_log_prob = old_actions_log_prob_batch.view(-1)
+        ratio = torch.exp(actions_log_prob - old_actions_log_prob)
+        surrogate = -advantages * ratio
+        surrogate_clipped = -advantages * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+        surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+        policy_loss = surrogate_loss - self.policy.alpha_temp.detach() * entropy.mean()
+
+        with torch.no_grad():
+            ratio_clip_fraction = ((ratio < 1.0 - self.clip_param) | (ratio > 1.0 + self.clip_param)).float().mean()
+            ratio_std = ratio.std(unbiased=False)
+        return (
+            policy_loss,
+            surrogate_loss,
+            {
+                "advantage_mean": advantage_mean.item(),
+                "advantage_std": advantage_std.item(),
+                "advantage_abs_mean": advantage_abs_mean.item(),
+                "ratio_mean": ratio.mean().item(),
+                "ratio_std": ratio_std.item(),
+                "ratio_clip_fraction": ratio_clip_fraction.item(),
+            },
+        )
 
     def update_critic(self, minibatch: dict) -> dict:
         obs_batch = minibatch["obs_batch"]
@@ -360,6 +502,37 @@ class REPPO:
             param.requires_grad = requires_grad
         for param in self.policy.norm.parameters():
             param.requires_grad = requires_grad
+
+    def _actor_loss_cosine(self, first_loss: torch.Tensor, second_loss: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        actor_params = [param for param in self.policy.actor.parameters() if param.requires_grad]
+        if not actor_params:
+            zero = torch.tensor(0.0, device=self.device)
+            return zero, zero, zero
+
+        first_grads = torch.autograd.grad(first_loss, actor_params, retain_graph=True, allow_unused=True)
+        second_grads = torch.autograd.grad(second_loss, actor_params, retain_graph=True, allow_unused=True)
+        first_flat = self._flatten_grads(first_grads, actor_params)
+        second_flat = self._flatten_grads(second_grads, actor_params)
+        first_norm = first_flat.norm()
+        second_norm = second_flat.norm()
+        cosine = torch.dot(first_flat, second_flat) / (first_norm * second_norm + 1e-8)
+        return cosine.detach(), first_norm.detach(), second_norm.detach()
+
+    def _cosine_to_reppo_weight(self, cosine: torch.Tensor) -> torch.Tensor:
+        normalized = cosine.clamp(0.0, 1.0).pow(self.cosine_weight_power)
+        return self.cosine_weight_min + (self.cosine_weight_max - self.cosine_weight_min) * normalized
+
+    @staticmethod
+    def _flatten_grads(
+        grads: tuple[torch.Tensor | None, ...], params: list[torch.nn.Parameter]
+    ) -> torch.Tensor:
+        flat_grads = [
+            torch.zeros_like(param).reshape(-1) if grad is None else grad.reshape(-1)
+            for grad, param in zip(grads, params, strict=True)
+        ]
+        if not flat_grads:
+            return torch.empty(0)
+        return torch.cat(flat_grads)
 
     def train_mode(self) -> None:
         """Set train mode for learnable models."""

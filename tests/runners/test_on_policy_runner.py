@@ -168,6 +168,13 @@ def _build_reppo_runner(log_dir: str | None = None) -> OnPolicyRunner:
     return OnPolicyRunner(env, cfg, log_dir=log_dir, device="cpu")
 
 
+def _build_reppo_runner_with_actor_route(actor_route: str) -> OnPolicyRunner:
+    env = DummyEnv()
+    cfg = _make_reppo_train_cfg()
+    cfg["algorithm"]["actor_route"] = actor_route
+    return OnPolicyRunner(env, cfg, log_dir=None, device="cpu")
+
+
 class TestRunnerConstruction:
     """Tests for constructing the runner and its components."""
 
@@ -215,6 +222,16 @@ class TestLearnLoop:
     def test_reppo_learn_runs_without_error(self) -> None:
         """A short REPPO learn call should complete without invalid std errors."""
         runner = _build_reppo_runner()
+        runner.learn(num_learning_iterations=1)
+
+    def test_reppo_hybrid_actor_route_runs_without_error(self) -> None:
+        """REPPO's cosine-gated hybrid actor route should run a short learn call."""
+        runner = _build_reppo_runner_with_actor_route("hybrid")
+        runner.learn(num_learning_iterations=1)
+
+    def test_reppo_ppo_only_actor_route_runs_without_error(self) -> None:
+        """REPPO's PPO-only actor route should run while keeping ActorQ/HL-Gauss."""
+        runner = _build_reppo_runner_with_actor_route("ppo_only")
         runner.learn(num_learning_iterations=1)
 
 
