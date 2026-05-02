@@ -40,7 +40,8 @@ class REPPO:
         clip_param: float = 0.2,
         actor_route: str = "reppo",
         ppo_advantage_normalization: bool = False,
-        ppo_entropy_coef: float = 0.005,
+        ppo_entropy_coef: float = 0.01,
+        ppo_value_loss_coef: float = 1.0,
         ppo_schedule: str = "adaptive",
         cosine_weight_min: float = 0.0,
         cosine_weight_max: float = 1.0,
@@ -86,10 +87,19 @@ class REPPO:
         else:
             self.symmetry = None
 
+        valid_actor_routes = {"reppo", "hybrid", "ppo_only"}
+        if actor_route not in valid_actor_routes:
+            raise ValueError(
+                f"Unsupported REPPO actor_route={actor_route!r}. Expected one of {valid_actor_routes}."
+            )
+
         self.policy = policy.to(self.device)
         self.old_policy = copy.deepcopy(self.policy).to(self.device)
         self.old_policy.eval()
-        self.optimizer = optim.AdamW(self.policy.parameters(), lr=learning_rate, weight_decay=1e-3, betas=(0.9, 0.95))
+        if actor_route in {"hybrid", "ppo_only"}:
+            self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        else:
+            self.optimizer = optim.AdamW(self.policy.parameters(), lr=learning_rate, weight_decay=1e-3, betas=(0.9, 0.95))
         self.storage = storage
         self.transition = ReppoRolloutStorage.Transition()
 
@@ -105,20 +115,18 @@ class REPPO:
         self.actor_route = actor_route
         self.ppo_advantage_normalization = ppo_advantage_normalization
         self.ppo_entropy_coef = ppo_entropy_coef
+        self.ppo_value_loss_coef = ppo_value_loss_coef
         self.ppo_schedule = ppo_schedule
         self.cosine_weight_min = cosine_weight_min
         self.cosine_weight_max = cosine_weight_max
         self.cosine_weight_power = cosine_weight_power
 
-        valid_actor_routes = {"reppo", "hybrid", "ppo_only"}
-        if self.actor_route not in valid_actor_routes:
-            raise ValueError(
-                f"Unsupported REPPO actor_route={self.actor_route!r}. Expected one of {valid_actor_routes}."
-            )
         if self.clip_param <= 0.0:
             raise ValueError(f"clip_param must be positive, got {self.clip_param}.")
         if self.ppo_entropy_coef < 0.0:
             raise ValueError(f"ppo_entropy_coef must be non-negative, got {self.ppo_entropy_coef}.")
+        if self.ppo_value_loss_coef < 0.0:
+            raise ValueError(f"ppo_value_loss_coef must be non-negative, got {self.ppo_value_loss_coef}.")
         if self.ppo_schedule not in {"adaptive", "fixed"}:
             raise ValueError(f"Unsupported ppo_schedule={self.ppo_schedule!r}. Expected 'adaptive' or 'fixed'.")
         if not 0.0 <= self.cosine_weight_min <= self.cosine_weight_max <= 1.0:
@@ -133,7 +141,8 @@ class REPPO:
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         self.transition.actions = self.policy.act(obs).detach()
-        self.transition.values = self.policy.evaluate(obs, self.transition.actions).detach()
+        value_actions = self.policy.action_mean.detach() if self.actor_route in {"hybrid", "ppo_only"} else self.transition.actions
+        self.transition.values = self.policy.evaluate(obs, value_actions).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
@@ -174,8 +183,10 @@ class REPPO:
     def compute_returns(self, obs: TensorDict) -> None:
         st = self.storage
         last_action = self.policy.act(obs).detach()
+        if self.actor_route in {"hybrid", "ppo_only"}:
+            last_action = self.policy.action_mean.detach()
         last_values = self.policy.evaluate(obs, last_action).detach().view(-1, 1)
-        if self.actor_route == "ppo_only":
+        if self.actor_route in {"hybrid", "ppo_only"}:
             self._compute_ppo_returns(last_values)
             return
 
@@ -205,6 +216,9 @@ class REPPO:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
     def update(self) -> dict[str, float]:
+        if self.actor_route in {"hybrid", "ppo_only"}:
+            return self._update_actor_route_with_ppo_mechanics()
+
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
@@ -337,6 +351,160 @@ class REPPO:
             loss_dict["symmetry"] = mean_symmetry_loss
         return loss_dict
 
+    def _update_actor_route_with_ppo_mechanics(self) -> dict[str, float]:
+        mean_value_loss = 0.0
+        mean_surrogate_loss = 0.0
+        mean_entropy = 0.0
+        mean_actor_reppo_loss = 0.0
+        mean_actor_ppo_loss = 0.0
+        mean_reppo_route_weight = 0.0
+        mean_cosine_gq_gppo = 0.0
+        mean_norm_gq = 0.0
+        mean_norm_gppo = 0.0
+        mean_ppo_advantage_abs = 0.0
+        mean_ratio_clip_fraction = 0.0
+        mean_kl_divergence = 0.0
+        mean_value_prediction_error = 0.0
+        mean_enc_dec_error = 0.0
+        mean_on_policy_values = 0.0
+
+        with torch.no_grad():
+            self.old_policy.load_state_dict(self.policy.state_dict())
+
+        generator = self.storage.recurrent_mini_batch_generator if self.policy.is_recurrent else self.storage.mini_batch_generator
+        for (
+            obs_batch,
+            actions_batch,
+            values_batch,
+            advantages_batch,
+            returns_batch,
+            truncations_batch,
+            old_actions_log_prob_batch,
+            old_mean_batch,
+            old_std_batch,
+            hidden_states_batch,
+            masks_batch,
+        ) in generator(self.num_mini_batches, self.num_learning_epochs):
+            del values_batch
+
+            self.policy.act(obs_batch, hidden_states_batch, masks_batch)
+            predicted_policy = self.policy.distribution
+            predicted_actions = predicted_policy.rsample()
+            entropy = self._policy_entropy(predicted_policy, predicted_actions)
+
+            self._set_critic_grad(False)
+            on_policy_values = self.policy.evaluate(obs_batch, predicted_actions, hidden_states_batch, masks_batch)
+            pathwise_q_loss = -on_policy_values.mean()
+            self._set_critic_grad(True)
+
+            value_loss, value_metrics = self._compute_value_loss(
+                obs_batch,
+                old_mean_batch,
+                returns_batch,
+                truncations_batch,
+                hidden_states_batch,
+                masks_batch,
+            )
+
+            ppo_kl_divergence = self._compute_ppo_kl_divergence(
+                predicted_policy,
+                obs_batch,
+                hidden_states_batch,
+                masks_batch,
+            )
+            self._adapt_ppo_learning_rate(ppo_kl_divergence.mean())
+
+            reppo_policy_loss = pathwise_q_loss if self.actor_route == "hybrid" else torch.tensor(0.0, device=self.device)
+
+            ppo_policy_loss, ppo_surrogate_loss, ppo_metrics = self._compute_ppo_actor_loss(
+                predicted_policy,
+                entropy,
+                actions_batch,
+                advantages_batch,
+                old_actions_log_prob_batch,
+            )
+
+            cosine_gq_gppo = torch.tensor(0.0, device=self.device)
+            norm_gq = torch.tensor(0.0, device=self.device)
+            norm_gppo = torch.tensor(0.0, device=self.device)
+            reppo_route_weight = torch.tensor(0.0, device=self.device)
+            policy_loss = ppo_policy_loss
+            if self.actor_route == "hybrid":
+                cosine_gq_gppo, norm_gq, norm_gppo = self._actor_loss_cosine(pathwise_q_loss, ppo_surrogate_loss)
+                reppo_route_weight = self._cosine_to_reppo_weight(cosine_gq_gppo)
+                policy_loss = reppo_route_weight * reppo_policy_loss + (1.0 - reppo_route_weight) * ppo_policy_loss
+
+            self.optimizer.zero_grad()
+            (self.ppo_value_loss_coef * value_loss).backward()
+            self._set_critic_grad(False)
+            actor_loss = policy_loss
+            actor_loss.backward()
+            self._set_critic_grad(True)
+            if self.is_multi_gpu:
+                self.reduce_parameters()
+            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+
+            mean_value_loss += value_loss.item()
+            mean_surrogate_loss += ppo_surrogate_loss.item()
+            mean_entropy += entropy.mean().item()
+            mean_actor_reppo_loss += reppo_policy_loss.item()
+            mean_actor_ppo_loss += ppo_policy_loss.item()
+            mean_reppo_route_weight += reppo_route_weight.item()
+            mean_cosine_gq_gppo += cosine_gq_gppo.item()
+            mean_norm_gq += norm_gq.item()
+            mean_norm_gppo += norm_gppo.item()
+            mean_ppo_advantage_abs += ppo_metrics["advantage_abs_mean"]
+            mean_ratio_clip_fraction += ppo_metrics["ratio_clip_fraction"]
+            mean_kl_divergence += ppo_kl_divergence.mean().item()
+            mean_value_prediction_error += value_metrics["value_prediction_error"]
+            mean_enc_dec_error += value_metrics["enc_dec_error"]
+            mean_on_policy_values += on_policy_values.mean().item()
+
+        num_updates = self.num_learning_epochs * self.num_mini_batches
+        mean_value_loss /= num_updates
+        mean_surrogate_loss /= num_updates
+        mean_entropy /= num_updates
+        mean_actor_reppo_loss /= num_updates
+        mean_actor_ppo_loss /= num_updates
+        mean_reppo_route_weight /= num_updates
+        mean_cosine_gq_gppo /= num_updates
+        mean_norm_gq /= num_updates
+        mean_norm_gppo /= num_updates
+        mean_ppo_advantage_abs /= num_updates
+        mean_ratio_clip_fraction /= num_updates
+        mean_kl_divergence /= num_updates
+        mean_value_prediction_error /= num_updates
+        mean_enc_dec_error /= num_updates
+        mean_on_policy_values /= num_updates
+
+        print("value prediction error: ", mean_value_prediction_error)
+        print("enc dec error: ", mean_enc_dec_error)
+        print("on policy values mean: ", mean_on_policy_values)
+        print("entropy: ", mean_entropy)
+        print("kl divergence: ", mean_kl_divergence)
+        print("actor route: ", self.actor_route)
+        print("reppo route weight: ", mean_reppo_route_weight)
+        print("cosine gQ gPPO: ", mean_cosine_gq_gppo)
+        print("entropy target: ", self.target_entropy)
+        print("alpha temp: ", self.policy.alpha_temp.item())
+        print("alpha kl: ", self.policy.alpha_kl.item())
+
+        self.storage.clear()
+        return {
+            "value": mean_value_loss,
+            "surrogate": mean_surrogate_loss,
+            "entropy": mean_entropy,
+            "actor_reppo": mean_actor_reppo_loss,
+            "actor_ppo": mean_actor_ppo_loss,
+            "reppo_route_weight": mean_reppo_route_weight,
+            "cosine_gQ_gPPO": mean_cosine_gq_gppo,
+            "norm_gQ": mean_norm_gq,
+            "norm_gPPO": mean_norm_gppo,
+            "ppo_advantage_abs_mean": mean_ppo_advantage_abs,
+            "ratio_clip_fraction": mean_ratio_clip_fraction,
+        }
+
     def update_actor(self, minibatch: dict) -> dict:
         obs_batch = minibatch["obs_batch"]
         actions_batch = minibatch["actions_batch"]
@@ -350,18 +518,17 @@ class REPPO:
         predicted_actions = predicted_policy.rsample()
         on_policy_values = self.policy.evaluate(obs_batch, predicted_actions, hidden_states_batch, masks_batch)
 
-        entropy = -predicted_policy.log_prob(predicted_actions).sum(-1)
+        entropy = self._policy_entropy(predicted_policy, predicted_actions)
         entropy_loss = self.policy.alpha_temp.detach() * entropy
         primary_policy_loss = -(on_policy_values + entropy_loss)
         pathwise_q_loss = -on_policy_values.mean()
 
-        with torch.no_grad():
-            self.old_policy.act(obs_batch, hidden_states_batch, masks_batch)
-            old_policy_distribution = self.old_policy.distribution
-            old_policy_actions = old_policy_distribution.sample((4,))
-            log_prob_old = old_policy_distribution.log_prob(old_policy_actions).detach()
-        log_prob_new = predicted_policy.log_prob(old_policy_actions)
-        kl_divergence = (log_prob_old - log_prob_new).sum(-1).mean(0)
+        kl_divergence = self._compute_reppo_kl_divergence(
+            predicted_policy,
+            obs_batch,
+            hidden_states_batch,
+            masks_batch,
+        )
         if self.actor_route == "ppo_only":
             self._adapt_ppo_learning_rate(kl_divergence.mean())
 
@@ -421,6 +588,71 @@ class REPPO:
             "kl_divergence": kl_divergence.mean().item(),
             "on_policy_values_mean": on_policy_values.mean().item(),
         }
+
+    def _policy_entropy(
+        self, predicted_policy: torch.distributions.Distribution, predicted_actions: torch.Tensor
+    ) -> torch.Tensor:
+        if getattr(self.policy, "distribution_type", None) == "normal":
+            entropy_attr = getattr(predicted_policy, "entropy", None)
+            if callable(entropy_attr):
+                try:
+                    entropy = entropy_attr()
+                except NotImplementedError:
+                    entropy = None
+                if entropy is not None:
+                    return entropy.sum(-1) if entropy.ndim > 1 else entropy
+        return -predicted_policy.log_prob(predicted_actions).sum(-1)
+
+    def _compute_reppo_kl_divergence(
+        self,
+        predicted_policy: torch.distributions.Distribution,
+        obs_batch: TensorDict,
+        hidden_states_batch: torch.Tensor,
+        masks_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            self.old_policy.act(obs_batch, hidden_states_batch, masks_batch)
+            old_policy_distribution = self.old_policy.distribution
+            old_policy_actions = old_policy_distribution.sample((4,))
+            log_prob_old = old_policy_distribution.log_prob(old_policy_actions).detach()
+        log_prob_new = predicted_policy.log_prob(old_policy_actions)
+        return (log_prob_old - log_prob_new).sum(-1).mean(0)
+
+    def _compute_ppo_kl_divergence(
+        self,
+        predicted_policy: torch.distributions.Distribution,
+        obs_batch: TensorDict,
+        hidden_states_batch: torch.Tensor,
+        masks_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            self.old_policy.act(obs_batch, hidden_states_batch, masks_batch)
+            old_policy_distribution = self.old_policy.distribution
+            old_loc, old_scale = self._base_normal_params(old_policy_distribution)
+
+        new_loc, new_scale = self._base_normal_params(predicted_policy)
+        if old_loc is None or old_scale is None or new_loc is None or new_scale is None:
+            return self._compute_reppo_kl_divergence(
+                predicted_policy,
+                obs_batch,
+                hidden_states_batch,
+                masks_batch,
+            ).detach()
+
+        old_scale = old_scale.detach().clamp_min(1.0e-8)
+        old_loc = old_loc.detach()
+        new_scale = new_scale.clamp_min(1.0e-8)
+        kl = torch.log(new_scale / old_scale)
+        kl = kl + (old_scale.square() + (old_loc - new_loc).square()) / (2.0 * new_scale.square())
+        kl = kl - 0.5
+        return kl.sum(-1)
+
+    @staticmethod
+    def _base_normal_params(distribution: torch.distributions.Distribution) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        base_distribution = getattr(distribution, "base_dist", distribution)
+        loc = getattr(base_distribution, "loc", None)
+        scale = getattr(base_distribution, "scale", None)
+        return loc, scale
 
     def _compute_ppo_actor_loss(
         self,
@@ -490,13 +722,14 @@ class REPPO:
         hidden_states_batch = minibatch["hidden_states_batch"]
         masks_batch = minibatch["masks_batch"]
 
-        value_prediction, value_logits = self.policy.evaluate(
-            obs_batch, actions_batch, hidden_states_batch, masks_batch, return_logits=True
+        value_loss, value_metrics = self._compute_value_loss(
+            obs_batch,
+            actions_batch,
+            returns_batch,
+            truncations_batch,
+            hidden_states_batch,
+            masks_batch,
         )
-        embedded_returns = self.policy.hlgauss_embed(returns_batch.view(-1)).view(value_logits.shape).detach()
-        value_loss_per_sample = -(embedded_returns * torch.log_softmax(value_logits, dim=-1)).sum(-1)
-        value_loss_weights = 1.0 - truncations_batch.view(-1).float()
-        value_loss = (value_loss_weights * value_loss_per_sample).sum() / value_loss_weights.sum().clamp_min(1.0)
 
         self.optimizer.zero_grad()
         value_loss.backward()
@@ -505,11 +738,29 @@ class REPPO:
         nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
         self.optimizer.step()
 
+        return {"value_loss": value_loss.item(), **value_metrics}
+
+    def _compute_value_loss(
+        self,
+        obs_batch: TensorDict,
+        actions_batch: torch.Tensor,
+        returns_batch: torch.Tensor,
+        truncations_batch: torch.Tensor,
+        hidden_states_batch: torch.Tensor,
+        masks_batch: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        value_prediction, value_logits = self.policy.evaluate(
+            obs_batch, actions_batch, hidden_states_batch, masks_batch, return_logits=True
+        )
+        embedded_returns = self.policy.hlgauss_embed(returns_batch.view(-1)).view(value_logits.shape).detach()
+        value_loss_per_sample = -(embedded_returns * torch.log_softmax(value_logits, dim=-1)).sum(-1)
+        value_loss_weights = 1.0 - truncations_batch.view(-1).float()
+        value_loss = (value_loss_weights * value_loss_per_sample).sum() / value_loss_weights.sum().clamp_min(1.0)
+
         value_prediction_error = (value_prediction.view(-1) - returns_batch.view(-1)).abs().mean().item()
         decoded_returns = self.policy.hlgauss_decode(torch.log(embedded_returns)).detach()
         enc_dec_error = (decoded_returns.view(-1) - returns_batch.view(-1)).abs().mean().item()
-        return {
-            "value_loss": value_loss.item(),
+        return value_loss, {
             "value_prediction_error": value_prediction_error,
             "enc_dec_error": enc_dec_error,
         }
