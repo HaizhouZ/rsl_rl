@@ -175,6 +175,14 @@ def _build_reppo_runner_with_actor_route(actor_route: str) -> OnPolicyRunner:
     return OnPolicyRunner(env, cfg, log_dir=None, device="cpu")
 
 
+def _build_reppo_runner_with_value_head(actor_route: str) -> OnPolicyRunner:
+    env = DummyEnv()
+    cfg = _make_reppo_train_cfg()
+    cfg["policy"]["use_value_head"] = True
+    cfg["algorithm"]["actor_route"] = actor_route
+    return OnPolicyRunner(env, cfg, log_dir=None, device="cpu")
+
+
 class TestRunnerConstruction:
     """Tests for constructing the runner and its components."""
 
@@ -235,6 +243,11 @@ class TestLearnLoop:
         alpha_temp_before = runner.alg.policy.alpha_temp.detach().clone()
         runner.learn(num_learning_iterations=1)
         assert torch.equal(runner.alg.policy.alpha_temp.detach(), alpha_temp_before)
+
+    def test_reppo_ppo_only_value_head_runs_without_error(self) -> None:
+        """REPPO's PPO-only actor route should run with ActorQ's PPO-style value head."""
+        runner = _build_reppo_runner_with_value_head("ppo_only")
+        runner.learn(num_learning_iterations=1)
 
 
 class TestSaveLoad:

@@ -42,6 +42,7 @@ class ActorQ(nn.Module):
         action_lower_bound: float = -1.0,
         action_upper_bound: float = 1.0,
         min_std: float = 1.0e-4,
+        use_value_head: bool = False,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -106,6 +107,10 @@ class ActorQ(nn.Module):
         self.action_lower_bound = action_lower_bound
         self.action_upper_bound = action_upper_bound
         print(f"Critic MLP: {self.critic}")
+        self.use_value_head = use_value_head
+        if self.use_value_head:
+            self.value_critic = MLP(num_critic_obs - num_actions, 1, critic_hidden_dims, activation)
+            print(f"Value MLP: {self.value_critic}")
 
         self.critic_obs_normalization = critic_obs_normalization
         if critic_obs_normalization:
@@ -249,6 +254,13 @@ class ActorQ(nn.Module):
         embeddings = self.activation_fn(embeddings)
         embeddings = self.norm(embeddings)
         return self.critic_embedding_layer(self.activation_fn(embeddings), return_logits=return_logits)
+
+    def evaluate_value(self, obs: TensorDict | torch.Tensor, *args, **kwargs: dict[str, Any]) -> torch.Tensor:
+        if not self.use_value_head:
+            raise RuntimeError("ActorQ.evaluate_value requires use_value_head=True.")
+        obs = self.get_critic_obs(obs)
+        obs = self.critic_obs_normalizer(obs)
+        return self.value_critic(obs)
 
     def get_actor_obs(self, obs: TensorDict | torch.Tensor) -> torch.Tensor:
         if isinstance(obs, TensorDict):

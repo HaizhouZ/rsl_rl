@@ -141,8 +141,11 @@ class REPPO:
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         self.transition.actions = self.policy.act(obs).detach()
-        value_actions = self.policy.action_mean.detach() if self.actor_route in {"hybrid", "ppo_only"} else self.transition.actions
-        self.transition.values = self.policy.evaluate(obs, value_actions).detach()
+        if self._use_ppo_value_head():
+            self.transition.values = self.policy.evaluate_value(obs).detach().view(-1)
+        else:
+            value_actions = self.policy.action_mean.detach() if self.actor_route in {"hybrid", "ppo_only"} else self.transition.actions
+            self.transition.values = self.policy.evaluate(obs, value_actions).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
@@ -182,13 +185,18 @@ class REPPO:
 
     def compute_returns(self, obs: TensorDict) -> None:
         st = self.storage
-        last_action = self.policy.act(obs).detach()
         if self.actor_route in {"hybrid", "ppo_only"}:
-            last_action = self.policy.action_mean.detach()
-        last_values = self.policy.evaluate(obs, last_action).detach().view(-1, 1)
-        if self.actor_route in {"hybrid", "ppo_only"}:
+            if self._use_ppo_value_head():
+                last_values = self.policy.evaluate_value(obs).detach().view(-1, 1)
+            else:
+                last_action = self.policy.act(obs).detach()
+                last_action = self.policy.action_mean.detach()
+                last_values = self.policy.evaluate(obs, last_action).detach().view(-1, 1)
             self._compute_ppo_returns(last_values)
             return
+
+        last_action = self.policy.act(obs).detach()
+        last_values = self.policy.evaluate(obs, last_action).detach().view(-1, 1)
 
         recurr_value = last_values
         for step in reversed(range(st.num_transitions_per_env)):
@@ -385,8 +393,6 @@ class REPPO:
             hidden_states_batch,
             masks_batch,
         ) in generator(self.num_mini_batches, self.num_learning_epochs):
-            del values_batch
-
             self.policy.act(obs_batch, hidden_states_batch, masks_batch)
             predicted_policy = self.policy.distribution
             predicted_actions = predicted_policy.rsample()
@@ -397,14 +403,23 @@ class REPPO:
             pathwise_q_loss = -on_policy_values.mean()
             self._set_critic_grad(True)
 
-            value_loss, value_metrics = self._compute_value_loss(
-                obs_batch,
-                old_mean_batch,
-                returns_batch,
-                truncations_batch,
-                hidden_states_batch,
-                masks_batch,
-            )
+            if self._use_ppo_value_head():
+                value_loss, value_metrics = self._compute_ppo_value_loss(
+                    obs_batch,
+                    values_batch,
+                    returns_batch,
+                    hidden_states_batch,
+                    masks_batch,
+                )
+            else:
+                value_loss, value_metrics = self._compute_value_loss(
+                    obs_batch,
+                    old_mean_batch,
+                    returns_batch,
+                    truncations_batch,
+                    hidden_states_batch,
+                    masks_batch,
+                )
 
             ppo_kl_divergence = self._compute_ppo_kl_divergence(
                 predicted_policy,
@@ -603,6 +618,9 @@ class REPPO:
                     return entropy.sum(-1) if entropy.ndim > 1 else entropy
         return -predicted_policy.log_prob(predicted_actions).sum(-1)
 
+    def _use_ppo_value_head(self) -> bool:
+        return self.actor_route in {"hybrid", "ppo_only"} and bool(getattr(self.policy, "use_value_head", False))
+
     def _compute_reppo_kl_divergence(
         self,
         predicted_policy: torch.distributions.Distribution,
@@ -713,6 +731,26 @@ class REPPO:
                 self.learning_rate = lr_tensor.item()
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = self.learning_rate
+
+    def _compute_ppo_value_loss(
+        self,
+        obs_batch: TensorDict,
+        values_batch: torch.Tensor,
+        returns_batch: torch.Tensor,
+        hidden_states_batch: torch.Tensor,
+        masks_batch: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        del hidden_states_batch, masks_batch
+        value_prediction = self.policy.evaluate_value(obs_batch)
+        value_clipped = values_batch + (value_prediction - values_batch).clamp(-self.clip_param, self.clip_param)
+        value_losses = (returns_batch - value_prediction).pow(2)
+        value_losses_clipped = (returns_batch - value_clipped).pow(2)
+        value_loss = torch.max(value_losses, value_losses_clipped).mean()
+        value_prediction_error = (value_prediction.view(-1) - returns_batch.view(-1)).abs().mean().item()
+        return value_loss, {
+            "value_prediction_error": value_prediction_error,
+            "enc_dec_error": 0.0,
+        }
 
     def update_critic(self, minibatch: dict) -> dict:
         obs_batch = minibatch["obs_batch"]
