@@ -39,7 +39,9 @@ class REPPO:
         target_entropy: float = -1.0,
         clip_param: float = 0.2,
         actor_route: str = "reppo",
-        ppo_advantage_normalization: bool = True,
+        ppo_advantage_normalization: bool = False,
+        ppo_entropy_coef: float = 0.005,
+        ppo_schedule: str = "adaptive",
         cosine_weight_min: float = 0.0,
         cosine_weight_max: float = 1.0,
         cosine_weight_power: float = 1.0,
@@ -102,6 +104,8 @@ class REPPO:
         self.clip_param = clip_param
         self.actor_route = actor_route
         self.ppo_advantage_normalization = ppo_advantage_normalization
+        self.ppo_entropy_coef = ppo_entropy_coef
+        self.ppo_schedule = ppo_schedule
         self.cosine_weight_min = cosine_weight_min
         self.cosine_weight_max = cosine_weight_max
         self.cosine_weight_power = cosine_weight_power
@@ -113,6 +117,10 @@ class REPPO:
             )
         if self.clip_param <= 0.0:
             raise ValueError(f"clip_param must be positive, got {self.clip_param}.")
+        if self.ppo_entropy_coef < 0.0:
+            raise ValueError(f"ppo_entropy_coef must be non-negative, got {self.ppo_entropy_coef}.")
+        if self.ppo_schedule not in {"adaptive", "fixed"}:
+            raise ValueError(f"Unsupported ppo_schedule={self.ppo_schedule!r}. Expected 'adaptive' or 'fixed'.")
         if not 0.0 <= self.cosine_weight_min <= self.cosine_weight_max <= 1.0:
             raise ValueError(
                 "cosine_weight_min and cosine_weight_max must satisfy "
@@ -167,6 +175,10 @@ class REPPO:
         st = self.storage
         last_action = self.policy.act(obs).detach()
         last_values = self.policy.evaluate(obs, last_action).detach().view(-1, 1)
+        if self.actor_route == "ppo_only":
+            self._compute_ppo_returns(last_values)
+            return
+
         recurr_value = last_values
         for step in reversed(range(st.num_transitions_per_env)):
             next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
@@ -175,6 +187,22 @@ class REPPO:
             delta_n = next_is_not_terminal * self.gamma * recurr_value
             recurr_value = st.soft_rewards[step] + (1 - self.lam) * delta_1 + self.lam * delta_n
             st.returns[step] = recurr_value
+        st.advantages = st.returns - st.values
+        if not self.ppo_advantage_normalization:
+            st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+
+    def _compute_ppo_returns(self, last_values: torch.Tensor) -> None:
+        st = self.storage
+        advantage = 0
+        for step in reversed(range(st.num_transitions_per_env)):
+            next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
+            next_is_not_terminal = 1.0 - st.dones[step].float()
+            delta = st.rewards[step] + next_is_not_terminal * self.gamma * next_values - st.values[step]
+            advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
+            st.returns[step] = advantage + st.values[step]
+        st.advantages = st.returns - st.values
+        if not self.ppo_advantage_normalization:
+            st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
     def update(self) -> dict[str, float]:
         mean_value_loss = 0.0
@@ -226,7 +254,7 @@ class REPPO:
             obs_batch,
             actions_batch,
             values_batch,
-            _,
+            advantages_batch,
             returns_batch,
             truncations_batch,
             old_actions_log_prob_batch,
@@ -240,7 +268,7 @@ class REPPO:
                     "obs_batch": obs_batch,
                     "actions_batch": actions_batch,
                     "values_batch": values_batch,
-                    "returns_batch": returns_batch,
+                    "advantages_batch": advantages_batch,
                     "truncations_batch": truncations_batch,
                     "old_actions_log_prob_batch": old_actions_log_prob_batch,
                     "hidden_states_batch": hidden_states_batch,
@@ -312,8 +340,7 @@ class REPPO:
     def update_actor(self, minibatch: dict) -> dict:
         obs_batch = minibatch["obs_batch"]
         actions_batch = minibatch["actions_batch"]
-        values_batch = minibatch["values_batch"]
-        returns_batch = minibatch["returns_batch"]
+        advantages_batch = minibatch["advantages_batch"]
         old_actions_log_prob_batch = minibatch["old_actions_log_prob_batch"]
         hidden_states_batch = minibatch["hidden_states_batch"]
         masks_batch = minibatch["masks_batch"]
@@ -335,6 +362,8 @@ class REPPO:
             log_prob_old = old_policy_distribution.log_prob(old_policy_actions).detach()
         log_prob_new = predicted_policy.log_prob(old_policy_actions)
         kl_divergence = (log_prob_old - log_prob_new).sum(-1).mean(0)
+        if self.actor_route == "ppo_only":
+            self._adapt_ppo_learning_rate(kl_divergence.mean())
 
         policy_loss = torch.where(
             (kl_divergence < self.desired_kl).detach(),
@@ -347,8 +376,7 @@ class REPPO:
             predicted_policy,
             entropy,
             actions_batch,
-            values_batch,
-            returns_batch,
+            advantages_batch,
             old_actions_log_prob_batch,
         )
         cosine_gq_gppo = torch.tensor(0.0, device=self.device)
@@ -364,13 +392,13 @@ class REPPO:
             reppo_route_weight = torch.tensor(0.0, device=self.device)
             policy_loss = ppo_policy_loss
 
-        temp_target_loss = self.policy.alpha_temp * (entropy.mean() - self.target_entropy).detach()
-        kl_target_loss = self.policy.alpha_kl * (self.desired_kl - kl_divergence.mean()).detach()
-
         self._set_critic_grad(False)
         self.optimizer.zero_grad()
-        actor_loss = policy_loss + temp_target_loss
+        actor_loss = policy_loss
         if self.actor_route != "ppo_only":
+            temp_target_loss = self.policy.alpha_temp * (entropy.mean() - self.target_entropy).detach()
+            kl_target_loss = self.policy.alpha_kl * (self.desired_kl - kl_divergence.mean()).detach()
+            actor_loss = actor_loss + temp_target_loss
             actor_loss = actor_loss + kl_target_loss
         actor_loss.backward()
         if self.is_multi_gpu:
@@ -399,12 +427,11 @@ class REPPO:
         predicted_policy: torch.distributions.Distribution,
         entropy: torch.Tensor,
         actions_batch: torch.Tensor,
-        values_batch: torch.Tensor,
-        returns_batch: torch.Tensor,
+        advantages_batch: torch.Tensor,
         old_actions_log_prob_batch: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         with torch.no_grad():
-            advantages = returns_batch.view(-1) - values_batch.view(-1)
+            advantages = advantages_batch.view(-1)
             advantage_mean = advantages.mean()
             advantage_std = advantages.std(unbiased=False)
             advantage_abs_mean = advantages.abs().mean()
@@ -417,7 +444,7 @@ class REPPO:
         surrogate = -advantages * ratio
         surrogate_clipped = -advantages * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
         surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
-        policy_loss = surrogate_loss - self.policy.alpha_temp.detach() * entropy.mean()
+        policy_loss = surrogate_loss - self.ppo_entropy_coef * entropy.mean()
 
         with torch.no_grad():
             ratio_clip_fraction = ((ratio < 1.0 - self.clip_param) | (ratio > 1.0 + self.clip_param)).float().mean()
@@ -434,6 +461,26 @@ class REPPO:
                 "ratio_clip_fraction": ratio_clip_fraction.item(),
             },
         )
+
+    def _adapt_ppo_learning_rate(self, kl_mean: torch.Tensor) -> None:
+        if self.desired_kl is None or self.ppo_schedule != "adaptive":
+            return
+        with torch.inference_mode():
+            kl_mean = kl_mean.detach()
+            if self.is_multi_gpu:
+                torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
+                kl_mean /= self.gpu_world_size
+            if self.gpu_global_rank == 0:
+                if kl_mean > self.desired_kl * 2.0:
+                    self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                    self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+            if self.is_multi_gpu:
+                lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                torch.distributed.broadcast(lr_tensor, src=0)
+                self.learning_rate = lr_tensor.item()
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = self.learning_rate
 
     def update_critic(self, minibatch: dict) -> dict:
         obs_batch = minibatch["obs_batch"]

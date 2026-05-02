@@ -232,7 +232,9 @@ class TestLearnLoop:
     def test_reppo_ppo_only_actor_route_runs_without_error(self) -> None:
         """REPPO's PPO-only actor route should run while keeping ActorQ/HL-Gauss."""
         runner = _build_reppo_runner_with_actor_route("ppo_only")
+        alpha_temp_before = runner.alg.policy.alpha_temp.detach().clone()
         runner.learn(num_learning_iterations=1)
+        assert torch.equal(runner.alg.policy.alpha_temp.detach(), alpha_temp_before)
 
 
 class TestSaveLoad:
